@@ -8,7 +8,6 @@ use mqtt3::QoS;
 use atom::Atom;
 use bon::{Decode, Encode, ReadBonErr, ReadBuffer, WriteBuffer};
 use hash_value::hex::ToHex;
-use js_net::publish_global_mqtt_topic;
 use mqtt_tmp::data::Server;
 use mqtt_tmp::server::ServerNode;
 use pi_db::db::{Bin, Event, EventType, Iter, TabKV, TabMeta, Ware};
@@ -44,13 +43,7 @@ impl DBIter {
         &mut self,
         cb: Arc<Fn(Result<Option<(Arc<Vec<u8>>, Arc<Vec<u8>>)>, String>)>,
     ) -> Option<Result<Option<(Arc<Vec<u8>>, Arc<Vec<u8>>)>, String>> {
-        match self.0.next(cb.clone()) {
-            Some(v) => {
-                cb(v);
-                None
-            }
-            None => None,
-        }
+        self.0.next(cb.clone())
     }
 
     /**
@@ -703,169 +696,6 @@ pub fn tab_size(
     cb: Arc<Fn(Result<usize, String>)>,
 ) -> Option<Result<usize, String>> {
     tr.tab_size(&Atom::from(ware_name), &Atom::from(tab_name), cb)
-}
-
-//数据库监听器
-pub struct DBToMqttMonitor {
-    cfg: HashMap<Atom, HashMap<Atom, bool>>,
-    mqtt_server: ServerNode,
-}
-
-impl DBToMqttMonitor {
-    pub fn new(mqtt_server: &ServerNode, cfg: &[u8]) -> Result<DBToMqttMonitor, ReadBonErr> {
-        let r = HashMap::decode(&mut ReadBuffer::new(cfg, 0))?;
-        println!("new DBToMqttMonitor----------------{:?}", &r);
-        Ok(DBToMqttMonitor {
-            cfg: r,
-            mqtt_server: mqtt_server.clone(),
-        })
-    }
-}
-
-pub fn register_db_to_mqtt_monitor(mgr: &Mgr, monitor: DBToMqttMonitor) {
-    println!(
-        "register_db_to_mqtt_monitor-------------------------------------------------------------"
-    );
-    mgr.listen(Arc::new(monitor));
-}
-
-impl Monitor for DBToMqttMonitor {
-    fn notify(&self, e: Event, _mgr: Mgr) {
-        //如果名单中没有对应的库和表， 忽略该事件
-        match self.cfg.get(&e.ware) {
-            Some(tabs) => match tabs.get(&e.tab) {
-                Some(_) => (),
-                None => return,
-            },
-            None => return,
-        }
-
-        //        println!("db listen1-------------------------------------------ware{:?}, tab:{:?}", &e.ware, &e.tab);
-
-        //否则，将该事件投递到mqtt TODO
-        match &e.other {
-            &EventType::Tab {
-                key: ref k,
-                value: ref v,
-            } => {
-                let topic = String::from(*&e.ware.as_str())
-                    + "."
-                    + &*e.tab.as_str()
-                    + "."
-                    + k.to_hex().as_str();
-                let value = match v {
-                    Some(v) => Vec::from(v.as_slice()),
-                    None => {
-                        let mut wb = WriteBuffer::with_capacity(1);
-                        wb.write_nil();
-                        wb.unwrap()
-                    }
-                };
-                //                println!("db listen-------------------------------------------{:?}, topic:{}", value, &topic);
-                match self
-                    .mqtt_server
-                    .publish(false, QoS::AtMostOnce, Atom::from(topic), value)
-                {
-                    Ok(_) => (),
-                    Err(r) => println!("db listen reponse fail:{}", r),
-                };
-            }
-            &EventType::Meta(ref info) => {
-                let topic = String::from(*&e.ware.as_str()) + "." + &*e.tab.as_str();
-                let value = match info {
-                    Some(v) => {
-                        let mut wb = WriteBuffer::with_capacity(1);
-                        v.encode(&mut wb);
-                        wb.unwrap()
-                    }
-                    None => {
-                        let mut wb = WriteBuffer::with_capacity(1);
-                        wb.write_nil();
-                        wb.unwrap()
-                    }
-                };
-                match self
-                    .mqtt_server
-                    .publish(false, QoS::AtMostOnce, Atom::from(topic), value)
-                {
-                    Ok(_) => (),
-                    Err(r) => println!("{}", r),
-                };
-            }
-        }
-    }
-}
-
-//数据库监听器
-pub struct DBToGlobalMqttMonitor {
-    cfg: HashMap<Atom, HashMap<Atom, bool>>,
-}
-
-impl DBToGlobalMqttMonitor {
-    pub fn new(cfg: &[u8]) -> Result<DBToGlobalMqttMonitor, ReadBonErr> {
-        let r = HashMap::decode(&mut ReadBuffer::new(cfg, 0))?;
-        Ok(DBToGlobalMqttMonitor { cfg: r })
-    }
-}
-
-pub fn register_db_to_global_mqtt_monitor(mgr: &Mgr, monitor: DBToGlobalMqttMonitor) {
-    mgr.listen(Arc::new(monitor));
-}
-
-impl Monitor for DBToGlobalMqttMonitor {
-    fn notify(&self, e: Event, _mgr: Mgr) {
-        //如果名单中没有对应的库和表， 忽略该事件
-        match self.cfg.get(&e.ware) {
-            Some(tabs) => match tabs.get(&e.tab) {
-                Some(_) => (),
-                None => return,
-            },
-            None => return,
-        }
-
-        //        println!("db listen1-------------------------------------------ware{:?}, tab:{:?}", &e.ware, &e.tab);
-
-        //否则，将该事件投递到mqtt TODO
-        match &e.other {
-            &EventType::Tab {
-                key: ref k,
-                value: ref v,
-            } => {
-                let topic = String::from(*&e.ware.as_str())
-                    + "."
-                    + &*e.tab.as_str()
-                    + "."
-                    + k.to_hex().as_str();
-                let value = match v {
-                    Some(v) => Vec::from(v.as_slice()),
-                    None => {
-                        let mut wb = WriteBuffer::with_capacity(1);
-                        wb.write_nil();
-                        wb.unwrap()
-                    }
-                };
-                // println!("db listen-------------------------------------------{:?}, topic:{}", value, &topic);
-                publish_global_mqtt_topic(false, topic, value.as_slice());
-            }
-            &EventType::Meta(ref info) => {
-                let topic = String::from(*&e.ware.as_str()) + "." + &*e.tab.as_str();
-                let value = match info {
-                    Some(v) => {
-                        let mut wb = WriteBuffer::with_capacity(1);
-                        v.encode(&mut wb);
-                        wb.unwrap()
-                    }
-                    None => {
-                        let mut wb = WriteBuffer::with_capacity(1);
-                        wb.write_nil();
-                        wb.unwrap()
-                    }
-                };
-                // println!("db listen1-------------------------------------------{:?}, topic:{}", value, &topic);
-                publish_global_mqtt_topic(false, topic, value.as_slice());
-            }
-        }
-    }
 }
 
 /**

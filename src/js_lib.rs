@@ -6,6 +6,7 @@ use pi_vm::bonmgr::{ptr_jstype, BON_MGR};
 use pi_db::mgr::Mgr;
 use atom::Atom;
 use guid::GuidGen;
+use guid64::GuidGen64;
 use gray::{Gray, GrayTab};
 use ordmap::sbtree::{Tree};
 use ordmap::ordmap::{Entry, ImOrdMap, Iter};
@@ -64,6 +65,15 @@ pub fn create_arc_vmfactory(vmf: VMFactory) -> Arc<VMFactory> {
 */
 pub fn guid_gen(guid: &GuidGen, ctrl_id: u16) -> u128 {
     guid.gen(ctrl_id).0
+} 
+
+/**
+* 获取全局唯一id
+* @param guid 全局唯一id生成器
+* @returns 返回全局唯一id
+*/
+pub fn guid64_gen(guid: &GuidGen64) -> u64 {
+    guid.gen().0
 } 
 
 /**

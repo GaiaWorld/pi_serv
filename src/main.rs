@@ -22,11 +22,11 @@ extern crate toml;
 // extern crate pi_p2p;
 extern crate apm;
 extern crate atom;
-extern crate base;
 extern crate bon;
 extern crate file;
 extern crate gray;
 extern crate guid;
+extern crate guid64;
 extern crate handler;
 extern crate hash_value;
 extern crate httpc;
@@ -36,10 +36,10 @@ extern crate https_external;
 extern crate hash;
 extern crate libc;
 extern crate mqtt;
+extern crate mqtt_proxy;
 extern crate mqtt3;
 extern crate ordmap;
 extern crate pi_store;
-extern crate rpc;
 extern crate sinfo;
 extern crate tcp;
 extern crate time;
@@ -49,11 +49,13 @@ extern crate worker;
 extern crate ws;
 extern crate parking_lot;
 extern crate futures;
+extern crate crossbeam_channel;
 
 extern crate hex;
 extern crate regex;
 extern crate serde_json;
 extern crate dashmap;
+extern crate wheel;
 
 #[macro_use]
 extern crate lazy_static;
@@ -63,6 +65,7 @@ extern crate log;
 
 #[macro_use]
 extern crate env_logger;
+extern crate chrono;
 
 #[cfg(any(unix))]
 extern crate glob;
@@ -83,6 +86,7 @@ pub mod util;
 pub mod webshell;
 pub mod ptmgr;
 pub mod binary;
+pub mod timer_task;
 
 mod def_build;
 mod js_util;
@@ -90,17 +94,15 @@ mod pi_crypto_build;
 mod pi_db_build;
 mod pi_lib_gray_build;
 mod pi_lib_guid_build;
+mod pi_lib_guid_build64;
 mod pi_lib_sinfo_build;
 mod pi_math_hash_build;
-mod pi_net_mqtt_build;
 mod pi_net_net_build;
-mod pi_net_rpc_build;
 mod pi_serv_build;
 mod pi_vm_build;
 // mod pi_p2p_build;
 mod pi_net_httpc_build;
 mod pi_net_https_build;
-mod pi_net_rpc_tmp_build;
 mod pi_store_build;
 mod license_client;
 
@@ -113,6 +115,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crossbeam_channel::unbounded;
 use clap::{App, Arg, ArgMatches};
 #[cfg(not(unix))]
 use pi_vm::adapter::load_lib_backtrace;
@@ -136,8 +139,6 @@ use worker::worker_pool::WorkerPool;
 
 use init_js::exec_js;
 use webshell::init_shell;
-use js_base::IS_END;
-
 use js_env::{current_dir, env_var, set_current_dir, set_env_var};
 
 use apm::allocator::{get_max_alloced_limit, set_max_alloced_limit, CounterSystemAllocator};
@@ -160,6 +161,9 @@ use tcp::util::{TlsConfig};
 use std::fs::File;
 use license_client::License;
 use binary::Binary;
+use timer_task::tick;
+use chrono::Local;
+use hotfix::{NOTIFY_CHAN, GRAY_TABLE};
 
 #[global_allocator]
 static ALLOCATOR: CounterSystemAllocator = CounterSystemAllocator;
@@ -293,12 +297,11 @@ fn register_bon_mgr() {
     pi_math_hash_build::register(&BON_MGR);
     pi_db_build::register(&BON_MGR);
     pi_lib_guid_build::register(&BON_MGR);
+    pi_lib_guid_build64::register(&BON_MGR);
     pi_lib_gray_build::register(&BON_MGR);
     pi_lib_sinfo_build::register(&BON_MGR);
     pi_db_build::register(&BON_MGR);
     def_build::register(&BON_MGR);
-    pi_net_mqtt_build::register(&BON_MGR);
-    pi_net_rpc_build::register(&BON_MGR);
     pi_net_net_build::register(&BON_MGR);
     pi_serv_build::register(&BON_MGR);
     pi_vm_build::register(&BON_MGR);
@@ -306,7 +309,6 @@ fn register_bon_mgr() {
     // pi_p2p_build::register(&BON_MGR);
     pi_net_httpc_build::register(&BON_MGR);
     pi_net_https_build::register(&BON_MGR);
-    pi_net_rpc_tmp_build::register(&BON_MGR);
     pi_store_build::register(&BON_MGR);
     register(&BON_MGR);
 }
@@ -450,7 +452,16 @@ fn main() {
     // 启动license服务
     license_handle();
     // 启动日志系统
-    env_logger::builder().format_timestamp_millis().init();
+    env_logger::builder().format(|buf, record| {
+        writeln!(
+            buf,
+            "{} {} [{}] {}",
+            Local::now().format("%Y-%m-%d %H:%M:%S"),
+            record.level(),
+            record.module_path().unwrap_or("<unnamed>"),
+            &record.args()
+        )
+    }).init();
 
     // 加载堆栈跟踪库
     #[cfg(not(unix))]
@@ -495,9 +506,53 @@ fn main() {
     // 根据命令行参数决定是否启动shell
     enable_shell(&matches);
 
-    while !IS_END.lock().unwrap().0 {
-        println!("###############loop, {}", now_millisecond());
-        thread::sleep(Duration::from_millis(10000));
+    println!("\n\n################# pi_serv initialized successfully #################\n\n");
+
+    // 单独一个线程处理定时任务
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(10));
+            tick();
+        }
+    });
+
+    let mut counter: u64 = 0;
+
+
+    // 主线程处理热更时垃圾回收
+    loop {
+        counter = counter.wrapping_add(1);
+        let mut to_be_removed = vec![];
+        {
+            let gray_tab = &GRAY_TABLE.read().jsgrays;
+            let vmfs: Vec<_> = NOTIFY_CHAN.1.try_iter().collect();
+
+            for (version, vmf_name) in vmfs {
+                if let Some(gray) = gray_tab.get(version) {
+                    if let Some(jsgray) = gray.get(&vmf_name) {
+                        if jsgray.factory.size() == jsgray.factory.free_buf_size() + jsgray.factory.free_pool_size() {
+                            debug!("hotfix remove vmfactory name =  {:?}, version = {:?}", vmf_name, version);
+                            to_be_removed.push((version, vmf_name));
+                            // gray.remove(&vmf_name);
+                        } else {
+                            // 没有回收成功的再次放回队列中
+                            let _ = NOTIFY_CHAN.0.try_send((version, vmf_name));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (version, vmf_name) in to_be_removed {
+            if let Some(gray) = GRAY_TABLE.write().jsgrays.get_mut(version) {
+                gray.remove(&vmf_name);
+            }
+        }
+
+        if counter % 20 == 0 {
+            println!("###############loop, {}", now_millisecond());
+        }
+        thread::sleep(Duration::from_millis(500));
     }
 }
 

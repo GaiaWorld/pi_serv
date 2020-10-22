@@ -17,10 +17,6 @@ use timer::{TIMER, FuncRuner};
 use js_async::AsyncRequestHandler;
 use bon::ReadBonErr;
 
-lazy_static! {
-	pub static ref IS_END: Arc<Mutex<(bool,bool)>> = Arc::new(Mutex::new((false, false)));
-}
-
 /**
 * 创建一个自定义对象序列化元信息的引用计数
 * @param data 元信息的二进制数据
@@ -198,11 +194,4 @@ pub fn drop_native_obj(t: &JSType, js: &Arc<JS>) -> Result<bool, String> {
             Ok(false)
         }
     }
-}
-
-pub fn end(js: &Arc<JS>) {
-    IS_END.lock().unwrap().0 = true;
-    let b = js.get_objs();
-    let b = b.borrow();
-    println!("end--------------------------------------------------{}, native_obj_count:{}", IS_END.lock().unwrap().0, b.len());
 }

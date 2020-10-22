@@ -18,7 +18,7 @@ rand = "0.5.2"
 mqtt3 = { git = "https://github.com/tekjar/mqtt3" }
 pi_vm = { path = "../pi_vm" }
 hash_value = { path = "../pi_math/hash_value" }
-pi_crypto = { path = "../pi_crypto" }
+pi_crypto = { path = "../pi_crypto", features =  ["bls"] }
 pi_db = { path = "../pi_db" }
 net = { path = "../pi_net/net" }
 nodec = { path = "../pi_net/nodec" }
@@ -31,8 +31,7 @@ https_external = { package = "http", version = "0.2" }
 tcp = { path = "../pi_net/tcp" }
 ws = { path = "../pi_net/ws" }
 mqtt = { path = "../pi_net/mqtt" }
-base = { path = "../pi_net/base" }
-rpc = { path = "../pi_net/rpc" }
+mqtt_proxy = { path = "../pi_net/mqtt_proxy"}
 # pi_p2p = { path = "../pi_p2p" }
 pi_store = { path = "../pi_store" }
 atom = { path = "../pi_lib/atom" }
@@ -42,12 +41,14 @@ bon = { path = "../pi_lib/bon" }
 file = { path = "../pi_lib/file" }
 gray = {path = "../pi_lib/gray" }
 guid = {path = "../pi_lib/guid" }
+guid64 = {path = "../pi_lib/guid64" }
 util = {path = "../pi_lib/util" }
 sinfo = {path = "../pi_lib/sinfo" }
 timer = {path = "../pi_lib/timer" }
 ordmap = {path = "../pi_lib/ordmap" }
 apm = {path = "../pi_lib/apm" }
 time = { path = "../pi_lib/time"}
+wheel = { path = "../pi_lib/wheel"}
 parking_lot = "0.10.0"
 futures = "0.3"
 hash = { path = "../pi_lib/hash", features = ["xxhash"] }
@@ -55,6 +56,8 @@ serde_json = "1.0.51"
 hex = "0.3.2"
 regex = "1.3.6"
 dashmap = "3.11.0"
+chrono = "0.4"
+crossbeam-channel = "0.3.4"
 
 [target.'cfg(unix)'.dependencies]
 glob = "0.3"

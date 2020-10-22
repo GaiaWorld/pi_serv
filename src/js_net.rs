@@ -3,13 +3,10 @@ use std::sync::{ RwLock as StdRwlock };
 use std::net::SocketAddr;
 use std::io::{Error, ErrorKind};
 use std::env;
-
-use std::time::SystemTime;
-use std::sync::atomic::Ordering;
 use std::cell::RefCell;
-use std::marker::PhantomData;
 
 use fnv::FnvHashMap;
+use fnv::FnvHashSet;
 use mqtt3;
 use parking_lot::RwLock;
 use futures::future::BoxFuture;
@@ -21,21 +18,15 @@ use handler::{Args, Handler, SGenType};
 use gray::{GrayVersion, GrayTab};
 use atom::Atom;
 // use pi_p2p::manage::P2PManage;
-use rpc_tmp::traits::RPCServerTraits;
-use rpc_tmp::server::RPCServer;
-use net::data::{RawSocket, RawStream};
-use net::tls::{TlsSocket, TlsStream, TlsConfig as TlsCfg};
-use net::{Config, Protocol};
 use net::api::{Socket, Stream};
 use net::api::{NetManager, TlsManager};
-use net::data::ListenerFn;
 use mqtt_tmp::server::{ServerNode, ClientStub};
 use std::io::{Result as IOResult};
 use mqtt_tmp::data::Server;
 use mqtt_tmp::session::Session;
 use js_lib::JSGray;
 use worker::task::TaskType;
-use worker::impls::{unlock_js_task_queue, cast_js_task};
+use worker::impls::{unlock_js_task_queue, cast_js_task, cast_net_task};
 use tcp::connect::TcpSocket;
 use tcp::tls_connect::TlsSocket as FTlsSocket;
 use tcp::server::{AsyncWaitsHandle, AsyncPortsFactory, SocketListener};
@@ -43,12 +34,9 @@ use tcp::driver::{Socket as SocketTrait, Stream as StreamTrait, SocketConfig, As
 use tcp::buffer_pool::WriteBufferPool;
 use tcp::util::{close_socket, TlsConfig};
 use ws::server::WebsocketListenerFactory;
-use mqtt::v311::{WS_MQTT3_BROKER, WsMqtt311, WsMqtt311Factory, add_topic, publish_topic};
-use mqtt::tls_v311::WssMqtt311Factory;
-use base::service::{BaseListener, BaseService};
-use base::connect::encode;
-use rpc::service::{RpcService, RpcListener};
-use rpc::connect::RpcConnect;
+use mqtt::server::{WsMqttBrokerFactory, WssMqttBrokerFactory, register_listener, register_service, add_topic, publish_topic};
+use mqtt::util::AsyncResult;
+use mqtt_proxy::service::{MqttEvent, MqttConnectHandle, MqttProxyListener, MqttProxyService};
 use ptmgr::{PLAT_MGR, PlatMgrTrait};
 use https_external::header::HeaderMap;
 use hash::XHashMap;
@@ -69,12 +57,9 @@ use http::port::HttpPort;
 use http::static_cache::StaticCache;
 use http::request::HttpRequest;
 use http::response::{ResponseHandler, HttpResponse};
-use http::util::HttpRecvResult;
-use http::gateway::GatewayContext;
 use http::range_load::RangeLoad;
-
-use pi_db::db::TabMeta;
-use sinfo::EnumType;
+use crate::js_httpc::{HttpClientOptions, create_http_client, HttpClientBody, post};
+use httpc::{SharedHttpc, HttpClient};
 
 use binary::Binary;
 
@@ -89,6 +74,7 @@ lazy_static! {
     static ref CERTIFICATES: Arc<RwLock<FnvHashMap<u16, (String, String)>>> = Arc::new(RwLock::new(FnvHashMap::default()));
     static ref SECURE_HTTP_CONFIGS: Arc<RwLock<FnvHashMap<u16, Vec<HttpConfig>>>> = Arc::new(RwLock::new(FnvHashMap::default()));
     static ref INSECURE_HTTP_CONFIGS: Arc<RwLock<FnvHashMap<u16, Vec<HttpConfig>>>> = Arc::new(RwLock::new(FnvHashMap::default()));
+    static ref BROKER_TOPICS: Arc<RwLock<FnvHashMap<String, FnvHashSet<String>>>> = Arc::new(RwLock::new(FnvHashMap::default()));
 }
 
 struct InsecureServices((u16, Box<dyn AsyncServiceFactory<Connect = TcpSocket, Waits = AsyncWaitsHandle, Out = (), Future = BoxFuture<'static, ()>>>));
@@ -99,551 +85,6 @@ unsafe impl Sync for InsecureServices {}
 
 unsafe impl Send for SecureServices {}
 unsafe impl Sync for SecureServices {}
-
-
-fn now_millis() -> isize {
-    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        Err(e) => -1,
-        Ok(n) => n.as_millis() as isize,
-    }
-}
-
-/**
-* Tcp网络管理器
-*/
-pub struct NetMgr {
-    pub mgr: NetManager,
-    pub handler: Arc<Mutex<FnvHashMap<Atom, Vec<Box<Fn(Arc<Result<(RawSocket, Arc<StdRwlock<RawStream>>),Error>>,
-    Arc<Result<SocketAddr,Error>>) + Send>>>>>,
-    pub close_handler: Arc<Mutex<FnvHashMap<Atom, Vec<Box<Fn(usize, RawSocket) + Send>>>>>,
-}
-
-impl NetMgr {
-    /**
-    * 构建Tcp网络管理器
-    * @returns 返回Tcp网络管理器
-    */
-    pub fn new() -> NetMgr{
-        NetMgr{
-            mgr: NetManager::new(),
-            handler: Arc::new(Mutex::new(FnvHashMap::default())),
-            close_handler: Arc::new(Mutex::new(FnvHashMap::default())),
-        }
-    }
-
-    fn add_handler(&mut self, addr: String, protocol: String, f: Box<Fn(Arc<Result<(RawSocket, Arc<StdRwlock<RawStream>>),Error>>, Arc<Result<SocketAddr,Error>>) + Send>){
-        let key = Atom::from(addr.clone() + ":" + protocol.as_str());
-        let h = self.handler.clone();
-        let mut r = self.handler.lock().unwrap();
-        let c_h = self.close_handler.clone();
-        let key_copy = key.clone();
-        let v = r.entry(key).or_insert_with(||{
-            let c_h = c_h.clone();
-            {
-                let mut close_handler = c_h.lock().unwrap();
-                close_handler.insert(key_copy.clone(), Vec::new());
-            }
-            let arr = Vec::new();
-            let callback: ListenerFn = Box::new(move |peer: Result<(RawSocket, Arc<StdRwlock<RawStream>>),Error>, addr: Result<SocketAddr,Error>|{ 
-                let peer = Arc::new(peer);
-                let addr = Arc::new(addr);
-                let c_h = c_h.clone();
-
-                //设置关闭链接的回调
-                match peer.as_ref() {
-                    &Ok(ref peer) => {
-                        let socket = peer.0.clone();
-                        let key_copy = key_copy.clone();
-                        let stream = &peer.1;
-                        stream.write().unwrap().set_close_callback(Box::new(move |id: usize, _: IOResult<()>| {
-                            let c_h = c_h.clone();
-                            let socket = socket.clone();
-                            let close_handler = c_h.lock().unwrap();
-                            let close_handler = close_handler.get(&key_copy).unwrap();
-                            //通知链接关闭处理器
-                            for h in close_handler.iter() {
-                                h(id, socket.clone());
-                            }
-                        }));
-                    } ,
-                    Err(s) => println!("{}", s),
-                };
-
-                //链接成功， 通知链接成功处理器
-                let r = h.lock().unwrap();
-                let rr = r.get(&key_copy).unwrap();
-                for v in rr.iter(){
-                    v(peer.clone(),  addr.clone());
-                }
-            });
-            let cfg = Config{
-                protocol: match protocol.as_str() {
-                    "tcp" => Protocol::TCP,
-                    _ => {panic!("nonsupport protocol:{}", protocol);},
-                },
-                addr: addr.parse().unwrap()
-            };
-            self.mgr.bind(cfg, callback);
-            arr
-        });
-        v.push(f);
-    }
-
-    fn add_close_handler(&mut self, addr: &str, protocol: &str, f: Box<Fn(usize, RawSocket) + Send>){
-        let key = Atom::from(addr.to_string() + ":" + protocol);
-        let mut close_handler = self.close_handler.lock().unwrap();
-        let mut close_handler = close_handler.get_mut(&key).unwrap();
-        close_handler.push(f);
-    }
-}
-
-/**
-* Tls网络管理器
-*/
-pub struct TlsNetMgr {
-    pub mgr: TlsManager,
-    pub handler: Arc<Mutex<FnvHashMap<Atom, Vec<Box<Fn(Arc<Result<(TlsSocket, Arc<StdRwlock<TlsStream>>),Error>>,
-    Arc<Result<SocketAddr,Error>>) + Send>>>>>,
-    pub close_handler: Arc<Mutex<FnvHashMap<Atom, Vec<Box<Fn(usize, TlsSocket) + Send>>>>>,
-}
-
-impl TlsNetMgr {
-    /**
-    * 构建Tls网络管理器
-    * @returns 返回Tls网络管理器
-    */
-    pub fn new(recv_buff_size: usize) -> TlsNetMgr{
-        TlsNetMgr{
-            mgr: TlsManager::new(recv_buff_size),
-            handler: Arc::new(Mutex::new(FnvHashMap::default())),
-            close_handler: Arc::new(Mutex::new(FnvHashMap::default())),
-        }
-    }
-
-    fn add_handler(&mut self, addr: String, protocol: String, cert_path:String, key_path: String, f: Box<Fn(Arc<Result<(TlsSocket, Arc<StdRwlock<TlsStream>>),Error>>, Arc<Result<SocketAddr,Error>>) + Send>){
-        let key = Atom::from(addr.clone() + ":" + protocol.as_str());
-        let h = self.handler.clone();
-        let mut r = self.handler.lock().unwrap();
-        let c_h = self.close_handler.clone();
-        let key_copy = key.clone();
-        let v = r.entry(key).or_insert_with(||{
-            let c_h = c_h.clone();
-            {
-                let mut close_handler = c_h.lock().unwrap();
-                close_handler.insert(key_copy.clone(), Vec::new());
-            }
-            let arr = Vec::new();
-            let callback = Box::new(move |peer: Result<(TlsSocket, Arc<StdRwlock<TlsStream>>),Error>, addr: Result<SocketAddr,Error>|{
-                let peer = Arc::new(peer);
-                let addr = Arc::new(addr);
-                let c_h = c_h.clone();
-
-                //设置关闭链接的回调
-                match peer.as_ref() {
-                    &Ok(ref peer) => {
-                        let socket = peer.0.clone();
-                        let key_copy = key_copy.clone();
-                        let stream = &peer.1;
-                        stream.write().unwrap().set_close_callback(Box::new(move |id: usize, _: IOResult<()>| {
-                            let c_h = c_h.clone();
-                            let socket = socket.clone();
-                            let close_handler = c_h.lock().unwrap();
-                            let close_handler = close_handler.get(&key_copy).unwrap();
-                            //通知链接关闭处理器
-                            for h in close_handler.iter() {
-                                h(id, socket.clone());
-                            }
-                        }));
-                    } ,
-                    Err(s) => println!("{}", s),
-                };
-
-                //链接成功， 通知链接成功处理器
-                let r = h.lock().unwrap();
-                let rr = r.get(&key_copy).unwrap();
-                for v in rr.iter(){
-                    v(peer.clone(),  addr.clone());
-                }
-            });
-            let cfg = TlsCfg::new(
-                match protocol.as_str() {
-                    "tcp" => Protocol::TCP,
-                    _ => {panic!("nonsupport protocol:{}", protocol);},
-                },
-                addr.parse().unwrap(),
-                &cert_path,
-                &key_path
-            );
-            self.mgr.bind(cfg, callback);
-            arr
-        });
-        v.push(f);
-    }
-
-    fn add_close_handler(&mut self, addr: &str, protocol: &str, f: Box<Fn(usize, TlsSocket) + Send>){
-        let key = Atom::from(addr.to_string() + ":" + protocol);
-        let mut close_handler = self.close_handler.lock().unwrap();
-        let mut close_handler = close_handler.get_mut(&key).unwrap();
-        close_handler.push(f);
-    }
-}
-
-/**
-* 网络连接Handler
-*/
-#[derive(Clone)]
-pub struct NetHandler {
-    handler: Atom, //处理函数名称（js函数）
-    gray_tab: Arc<StdRwlock<GrayTab<JSGray>>>, //灰度表
-}
-
-unsafe impl Send for NetHandler {}
-unsafe impl Sync for NetHandler {}
-
-impl Handler for NetHandler {
-	type A = usize; //连接id
-    type B = ();
-    type C = ();
-    type D = ();
-    type E = ();
-    type F = ();
-    type G = ();
-    type H = ();
-	type HandleResult = Result<(), String>;
-
-	fn handle(&self, env: Arc<dyn GrayVersion>, event_name: Atom, args: Args<Self::A, Self::B, Self::C, Self::D, Self::E, Self::F, Self::G, Self::H>) -> Self::HandleResult {
-        let id = env.get_id();
-        let conect_id = match args {
-            Args::OneArgs(conect_id) => conect_id,
-            _ => return Err(String::from("invalid net event handler args")),
-        };
-        let gray_tab = self.gray_tab.read().unwrap();
-        let gray = match env.get_gray() {
-            Some(v) => match gray_tab.get(v) {
-                Some(g) => g.clone(),
-                None => return Err(String::from("gray is not exist, version:") + v.to_string().as_str()),
-            },
-            None => gray_tab.get_last().clone(),
-        };
-
-        let queue = new_queue(id); //创建指定socket的同步静态队列
-        let handler_name = self.handler.clone();
-        let event_name_copy = event_name.clone();
-        let func = Box::new(move |lock: Option<isize>| {
-            let mgr = gray.mgr.clone();
-            let event_name1 = event_name.clone();
-            let real_args = Box::new(move |vm: Arc<JS>| -> usize {
-                //事件对象
-                let event = vm.new_object();
-                vm.set_field(&event, String::from("event_name"), &mut vm.new_str((*event_name1).to_string()).unwrap());
-                vm.set_field(&event, String::from("connect_id"), &mut vm.new_u32(conect_id as u32));
-                //mgr
-                ptr_jstype(vm.get_objs(), vm.clone(), Box::into_raw(Box::new(mgr.clone())) as usize, 2976191628);
-                //env
-                ptr_jstype(vm.get_objs(), vm.clone(),  Box::into_raw(Box::new(env.clone())) as usize, 589055833);
-                3
-            });
-            gray.factory.call(Some(id), handler_name, real_args, Atom::from((*event_name).to_string() + " net task"));
-
-            //解锁当前同步静态队列，保证虚拟机执行
-            if !unlock_js_task_queue(queue) {
-                warn!("!!!> Net Handle Error, unlock task queue failed, queue: {:?}", queue);
-            }
-        });
-        cast_js_task(TaskType::Sync(true), 0, Some(queue), func, Atom::from("net ".to_string() + &self.handler + ":" + &event_name_copy + " handle task"));
-
-        Ok(())
-	}
-}
-
-impl NetHandler {
-	/**
-	* 构建一个网络连接Handler
-	* @param handler 处理器名称
-	* @param gray 灰度对象
-	* @returns 返回网络连接Handler
-	*/
-	pub fn new(handler: String, gray: JSGray) -> NetHandler {
-		NetHandler {
-			gray_tab: Arc::new(StdRwlock::new(GrayTab::new(gray))),
-            handler: Atom::from(handler),
-		}
-	}
-}
-
-/**
-* Topic处理器
-*/
-#[derive(Clone)]
-pub struct TopicHandler {
-	gray_tab: 	Arc<StdRwlock<GrayTab<JSGray>>>, //灰度表
-}
-
-unsafe impl Send for TopicHandler {}
-unsafe impl Sync for TopicHandler {}
-
-impl Handler for TopicHandler {
-	type A = u8;
-    type B = Option<SocketAddr>;
-    type C = Arc<Vec<u8>>;
-    type D = ();
-    type E = ();
-    type F = ();
-    type G = ();
-    type H = ();
-	type HandleResult = ();
-
-	fn handle(&self, env: Arc<dyn GrayVersion>, topic: Atom, args: Args<Self::A, Self::B, Self::C, Self::D, Self::E, Self::F, Self::G, Self::H>) -> Self::HandleResult {
-        let topic_handler = self.clone();
-        let topic_name = topic.clone();
-        let id = env.get_id();
-        let queue = new_queue(id); //创建指定socket的同步静态队列
-        let func = Box::new(move |lock: Option<isize>| {
-            println!("{}, net trace, run rpc task, token: {:?}, topic: {:?}", now_millis(), id, topic);
-            let gray_tab = topic_handler.gray_tab.read().unwrap();
-            let gray = match env.get_gray() {
-                Some(v) => match gray_tab.get(v) {
-                    Some(g) => g,
-                    None => panic!("gray is not exist, version:{}", v),
-                },
-                None => gray_tab.get_last(),
-            };
-            let mgr = gray.mgr.clone();
-            let topic_name = topic.clone();
-            let real_args = Box::new(move |vm: Arc<JS>| -> usize {
-                vm.new_str((*topic_name).to_string());
-                let peer_addr = match args {
-                    Args::ThreeArgs(_, peer, bin) => {
-                        let buffer = vm.new_uint8_array(bin.len() as u32);
-                        buffer.from_bytes(bin.as_slice());
-                        peer
-                    },
-                    _ => panic!("invalid topic handler args"),
-                };
-                let ptr = Box::into_raw(Box::new(mgr.clone())) as usize;
-                ptr_jstype(vm.get_objs(), vm.clone(), ptr, 2976191628);
-                let ptr = Box::into_raw(Box::new(env.clone())) as usize;
-                ptr_jstype(vm.get_objs(), vm.clone(), ptr, 717646231);
-                vm.new_u32(id as u32);
-                match peer_addr {
-                    Some(addr) => {
-                        vm.new_str(addr.to_string());
-                    },
-                    None => {
-                        vm.new_undefined();
-                    },
-                }
-                6
-            });
-            gray.factory.call(Some(id), Atom::from("_$rpc_tmp"), real_args, Atom::from((*topic).to_string() + " rpc task"));
-
-            //解锁当前同步静态队列，保证虚拟机执行
-            if !unlock_js_task_queue(queue) {
-                warn!("!!!> Topic Handle Error, unlock task queue failed, queue: {:?}", queue);
-            }
-        });
-        cast_js_task(TaskType::Sync(true), 0, Some(queue), func, Atom::from("topic ".to_string() + &topic_name + " handle task"));
-        println!("{}, net trace, topic handle, token: {:?}, topic: {:?}", now_millis(), id, topic_name);
-	}
-}
-
-impl TopicHandler {
-	/**
-	* 构建一个Topic处理器
-	* @param gray 灰度对象
-	* @returns 返回Topic处理器
-	*/
-	pub fn new(gray: &Arc<StdRwlock<GrayTab<JSGray>>>) -> Self {
-		TopicHandler {
-			gray_tab: gray.clone()
-		}
-	}
-}
-
-
-/**
-* 为mqtt绑定Tcp网络
-* @param mgr Tcp网络管理器
-* @param addr 绑定的地址
-* @param protocol 绑定的协议名
-* @param send_buf_size 发送缓冲区大小
-* @param recv_timeout 接收超时时长，单位毫秒
-* @returns 返回Mqtt服务器
-*/
-pub fn mqtt_bind(server: &ServerNode, mgr: &mut NetMgr, addr: String, protocol: String, send_buf_size: usize, recv_timeout: usize){
-    // let server = ServerNode::new();
-    let copy = server.clone();
-    let f = Box::new(move |peer:Arc<Result<(RawSocket, Arc<StdRwlock<RawStream>>),Error>>, _addr: Arc<Result<SocketAddr,Error>> | {
-        match peer.as_ref() {
-            &Ok(ref peer) => {
-                let socket = &peer.0;
-                let stream = &peer.1;
-                {let s = &mut stream.write().unwrap();
-                    s.set_send_buf_size(send_buf_size);
-                    s.set_recv_timeout(recv_timeout);
-                    s.set_socket(socket.clone());
-                }
-                copy.clone().add_stream(Socket::Raw(socket.clone()), Stream::Raw(stream.clone()));
-            } ,
-            Err(s) => println!("{}", s),
-        };
-    });
-    mgr.add_handler(addr.clone(), protocol.clone(), f);
-    let server_copy = server.clone();
-    mgr.add_close_handler(&addr, &protocol, Box::new(move |id, socket| {
-        server_copy.handle_close(id);
-    }));
-}
-
-/**
-* 设置Tcp网络连接和关闭处理器
-* @param mgr Tcp网络管理器
-* @param addr 绑定的地址
-* @param protocol 绑定的协议名
-* @param handler 连接处理器
-* @param close_handler 关闭处理器
-*/
-pub fn net_connect_bind(mgr: &mut NetMgr, addr: String, protocol: String, handler: &NetHandler, close_handler: &NetHandler) {
-    let handler = handler.clone();
-    let close_handler = close_handler.clone();
-    let close_callback = Box::new(move |id: usize, socket: RawSocket| {
-        remove_queue(id);
-        let socket = Arc::new(socket);
-        match close_handler.handle(socket.clone(), Atom::from("net_connect_close"), Args::OneArgs(id)) {
-            Ok(_) => (),
-            Err(s) => {
-                println!("{}", s);
-            },
-        };
-    });
-    let f = Box::new(move |peer:Arc<Result<(RawSocket, Arc<StdRwlock<RawStream>>),Error>>, _addr: Arc<Result<SocketAddr,Error>>| {
-        match peer.as_ref() {
-            &Ok(ref peer) => {
-                let socket = peer.0.clone();
-                let stream = &peer.1;
-                let id = socket.socket;
-                let socket = Arc::new(socket);
-                // let socket1 = socket.clone();
-                // let close_handler = close_handler.clone();
-                // stream.write().unwrap().set_close_callback(Box::new(move |id: usize, _| {
-                //     remove_queue(id);
-                //     match close_handler.handle(socket1.clone(), Atom::from("net_connect_close"), Args::OneArgs(id)) {
-                //         Ok(_) => (),
-                //         Err(s) => {
-                //             println!("{}", s);
-                //         },
-                //     };
-                // }));
-
-                match handler.handle(socket, Atom::from("net_connect"), Args::OneArgs(id)){
-                    Ok(_) => (),
-                    Err(s) => {
-                        println!("{}", s);
-                    },
-                }
-            } ,
-            Err(s) => println!("{}", s),
-        };
-        
-    });
-    mgr.add_handler(addr.clone(), protocol.clone(), f);
-    mgr.add_close_handler(&addr, &protocol, close_callback);
-}
-
-/**
-* 为mqtt绑定Tls网络
-* @param mgr Tls网络管理器
-* @param addr 绑定的地址
-* @param protocol 绑定的协议名
-* @param send_buf_size 发送缓冲区大小
-* @param recv_timeout 接收超时时长，单位毫秒
-* @returns 返回Mqtt服务器
-*/
-pub fn mqtt_bind_tls(server: &ServerNode, mgr: &mut TlsNetMgr, addr: String, protocol: String, cert_path: String, key_path: String, send_buf_size: usize, recv_timeout: usize){
-    let copy = server.clone();
-    let f = Box::new(move |peer:Arc<Result<(TlsSocket, Arc<StdRwlock<TlsStream>>),Error>>, _addr: Arc<Result<SocketAddr,Error>> | {
-        match peer.as_ref() {
-            &Ok(ref peer) => {
-                let socket = &peer.0;
-                let stream = &peer.1;
-                {let s = &mut stream.write().unwrap();
-                    s.set_send_buf_size(send_buf_size);
-                    s.set_recv_timeout(recv_timeout);
-                    s.set_socket(socket.clone());
-                }
-                copy.clone().add_stream(Socket::Tls(socket.clone()), Stream::Tls(stream.clone()));
-            } ,
-            Err(s) => println!("{}", s),
-        };
-    });
-    mgr.add_handler(addr.clone(), protocol.clone(), cert_path, key_path, f);
-    let server_copy = server.clone();
-    mgr.add_close_handler(&addr, &protocol, Box::new(move |id, socket| {
-        server_copy.handle_close(id);
-    }));
-}
-
-/**
-* 设置Tls网络连接和关闭处理器
-* @param mgr Tls网络管理器
-* @param addr 绑定的地址
-* @param protocol 绑定的协议名
-* @param handler 连接处理器
-* @param close_handler 关闭处理器
-*/
-pub fn net_connect_bind_tls(mgr: &mut TlsNetMgr, addr: String, protocol: String, cert_path: String, key_path: String, handler: &NetHandler, close_handler: &NetHandler) {
-    let handler = handler.clone();
-    let close_handler = close_handler.clone();
-    let close_callback = Box::new(move |id: usize, socket: TlsSocket| {
-        remove_queue(id);
-        let socket = Arc::new(socket);
-        match close_handler.handle(socket.clone(), Atom::from("net_connect_close"), Args::OneArgs(id)) {
-            Ok(_) => (),
-            Err(s) => {
-                println!("{}", s);
-            },
-        };
-    });
-    let f = Box::new(move |peer:Arc<Result<(TlsSocket, Arc<StdRwlock<TlsStream>>),Error>>, _addr: Arc<Result<SocketAddr,Error>>| {
-        match peer.as_ref() {
-            &Ok(ref peer) => {
-                let socket = peer.0.clone();
-                let stream = &peer.1;
-                let id = socket.socket;
-                let socket = Arc::new(socket);
-
-                match handler.handle(socket, Atom::from("net_connect"), Args::OneArgs(id)){
-                    Ok(_) => (),
-                    Err(s) => {
-                        println!("{}", s);
-                    },
-                }
-            } ,
-            Err(s) => println!("{}", s),
-        };
-        
-    });
-    mgr.add_handler(addr.clone(), protocol.clone(), cert_path, key_path, f);
-    mgr.add_close_handler(&addr, &protocol, close_callback);
-}
-
-/**
-* Copy指定的Mqtt服务器
-* @param node 待Copy的Mqtt服务器
-* @returns 返回已Copy的Mqtt服务器
-*/
-pub fn clone_server_node(node: &ServerNode) -> ServerNode{
-    node.clone()
-}
-
-/**
-* Copy指定的RPC服务器
-* @param server 待Copy的RPC服务器
-* @returns 返回已Copy的RPC服务器
-*/
-pub fn clone_rpc_server(server: &RPCServer) -> RPCServer{
-    server.clone()
-}
 
 /**
 * 为指定的Mqtt服务器设置topic
@@ -724,20 +165,6 @@ pub fn mqtt_respond(session: &Arc<Session>, topic: String, data: &[u8]) {
     session.respond(Atom::from(topic), Vec::from(data));
 }
 
-/**
-* 为rpc注册handler
-*/
-pub fn register_rpc_handler(serv: &mut RPCServer, topic: String, sync: bool, handler: &Arc<TopicHandler>) -> Result<(), Error> {
-    serv.register(Atom::from(topic), sync, handler.clone())
-}
-
-/**
-* 创建一个Topic处理器的引用计数
-*/
-pub fn arc_new_topic_handler(th: TopicHandler) -> Arc<TopicHandler> {
-    Arc::new(th)
-}
-
 //为pi_p2p封装一个P2PManage::new方法
 // pub fn p2p_manage_new(addr: &str, arr1: Vec<String>, arr2: Vec<u32>) -> P2PManage {
 
@@ -757,206 +184,7 @@ pub fn arc_new_topic_handler(th: TopicHandler) -> Arc<TopicHandler> {
 //     Arc::new(socket)
 // }
 
-/**
-* 网络事件处理器
-*/
-#[derive(Clone)]
-pub struct NetEventHandler {
-    handler: Atom, //处理函数名称（js函数）
-    gray_tab: Arc<StdRwlock<GrayTab<JSGray>>>, //灰度表
-}
-
-unsafe impl Send for NetEventHandler {}
-unsafe impl Sync for NetEventHandler {}
-
-impl Handler for NetEventHandler {
-    type A = usize; //连接id
-    type B = ();
-    type C = ();
-    type D = ();
-    type E = ();
-    type F = ();
-    type G = ();
-    type H = ();
-    type HandleResult = Result<(), String>;
-
-    fn handle(&self, env: Arc<dyn GrayVersion>, event_name: Atom, args: Args<Self::A, Self::B, Self::C, Self::D, Self::E, Self::F, Self::G, Self::H>) -> Self::HandleResult {
-        let id = env.get_id();
-        let conect_id = match args {
-            Args::OneArgs(conect_id) => conect_id,
-            _ => return Err(String::from("invalid net event handler args")),
-        };
-        let gray_tab = self.gray_tab.read().unwrap();
-        let gray = match env.get_gray() {
-            Some(v) => match gray_tab.get(v) {
-                Some(g) => g.clone(),
-                None => return Err(String::from("gray is not exist, version:") + v.to_string().as_str()),
-            },
-            None => gray_tab.get_last().clone(),
-        };
-
-        let mgr = gray.mgr.clone();
-
-        match event_name.as_ref() {
-            "rpc_net_connect" => {
-                let tr = mgr.transaction(true);
-                let str_meta = TabMeta::new(EnumType::Str, EnumType::Str);
-                let num_meta = TabMeta::new(EnumType::Str, EnumType::U32);
-                tr.alter(&Atom::from("_$session"), &Atom::from(format!("{}_str", id)), Some(Arc::new(str_meta)), Arc::new(move |_r| {}));
-                tr.alter(&Atom::from("_$session"), &Atom::from(format!("{}_num", id)), Some(Arc::new(num_meta)), Arc::new(move |_r| {}));
-                tr.prepare(Arc::new(move |_r| {}));
-                tr.commit(Arc::new(move |_r| {}));
-            }
-            _ => {}
-        }
-
-        let queue = new_queue(id); //创建指定socket的同步静态队列
-        let handler_name = self.handler.clone();
-        let event_name_copy = event_name.clone();
-        let func = Box::new(move |lock: Option<isize>| {
-            let event_name1 = event_name.clone();
-            let real_args = Box::new(move |vm: Arc<JS>| -> usize {
-                //事件对象
-                let event = vm.new_object();
-                vm.set_field(&event, String::from("event_name"), &mut vm.new_str((*event_name1).to_string()).unwrap());
-                vm.set_field(&event, String::from("connect_id"), &mut vm.new_u32(conect_id as u32));
-                //mgr
-                ptr_jstype(vm.get_objs(), vm.clone(), Box::into_raw(Box::new(mgr.clone())) as usize, 2976191628);
-                //env
-                ptr_jstype(vm.get_objs(), vm.clone(),  Box::into_raw(Box::new(env.clone())) as usize, 589055833);
-                3
-            });
-            gray.factory.call(Some(id), handler_name, real_args, Atom::from((*event_name).to_string() + " net task"));
-
-            //解锁当前同步静态队列，保证虚拟机执行
-            if !unlock_js_task_queue(queue) {
-                warn!("!!!> Net Handle Error, unlock task queue failed, queue: {:?}", queue);
-            }
-        });
-        cast_js_task(TaskType::Sync(true), 0, Some(queue), func, Atom::from("net ".to_string() + &self.handler + ":" + &event_name_copy + " handle task"));
-
-        Ok(())
-    }
-}
-
-impl NetEventHandler {
-    /**
-    * 构建一个网络事件处理器
-    * @param handler 处理器名称
-    * @param gray 灰度对象
-    * @returns 返回网络事件处理器
-    */
-    pub fn new(handler: String, gray: JSGray) -> NetEventHandler {
-        NetEventHandler {
-            gray_tab: Arc::new(StdRwlock::new(GrayTab::new(gray))),
-            handler: Atom::from(handler),
-        }
-    }
-}
-
 use hotfix::GrayTable;
-
-/**
-* Rpc请求处理器
-*/
-#[derive(Clone)]
-pub struct RequestHandler {
-    gray_tab: 	Arc<RwLock<GrayTable>>,
-}
-
-unsafe impl Send for RequestHandler {}
-unsafe impl Sync for RequestHandler {}
-
-impl Handler for RequestHandler {
-    type A = u8;
-    type B = Option<SocketAddr>;
-    type C = u32;
-    type D = Arc<Vec<u8>>;
-    type E = ();
-    type F = ();
-    type G = ();
-    type H = ();
-    type HandleResult = ();
-
-    fn handle(&self, env: Arc<dyn GrayVersion>, topic: Atom, args: Args<Self::A, Self::B, Self::C, Self::D, Self::E, Self::F, Self::G, Self::H>) -> Self::HandleResult {
-		let topic_handler = self.clone();
-        let topic_name = topic.clone();
-        let jsgray_name = topic.clone().to_string().split(".").collect::<Vec<&str>>()[0].to_string() + ".event.js";
-
-        let id = env.get_id();
-        let queue = new_queue(id); //创建指定socket的同步静态队列
-        let func = Box::new(move |lock: Option<isize>| {
-            let gray_tab = topic_handler.gray_tab.read();
-            let gray = match env.get_gray() {
-                Some(v) => match gray_tab.jsgrays.get(v.clone()) {
-                    Some(g) => g.get(&Atom::from(jsgray_name)),
-                    None => panic!("gray is not exist, version:{}", v),
-                }
-                None => {
-                    match gray_tab.jsgrays.last() {
-                        Some(g) => {
-                            g.get(&Atom::from(jsgray_name))
-                        }
-                        None => panic!("gray is not exist"),
-                    }
-                }
-            };
-
-            if let Some(gray) = gray {
-                let mgr = gray.mgr.clone();
-                let topic_name = topic.clone();
-                let real_args = Box::new(move |vm: Arc<JS>| -> usize {
-                    vm.new_str((*topic_name).to_string());
-                    let peer_addr = match args {
-                        Args::FourArgs(_, peer, rid, bin) => {
-                            let buffer = vm.new_uint8_array(bin.len() as u32);
-                            buffer.from_bytes(bin.as_slice());
-                            vm.new_u32(rid); // rid
-                            peer
-                        },
-                        _ => panic!("invalid topic handler args"),
-                    };
-                    let ptr = Box::into_raw(Box::new(mgr.clone())) as usize;
-                    ptr_jstype(vm.get_objs(), vm.clone(), ptr, 2976191628);
-                    let ptr = Box::into_raw(Box::new(env.clone())) as usize;
-                    ptr_jstype(vm.get_objs(), vm.clone(), ptr, 3092548949);
-                    vm.new_u32(id as u32);
-                    match peer_addr {
-                        Some(addr) => {
-                            vm.new_str(addr.to_string());
-                        },
-                        None => {
-                            vm.new_undefined();
-                        },
-                    }
-                    7
-                });
-                gray.factory.call(Some(id), Atom::from("_$rpc"), real_args, Atom::from((*topic).to_string() + " rpc task"));
-
-                //解锁当前同步静态队列，保证虚拟机执行
-                if !unlock_js_task_queue(queue) {
-                    warn!("!!!> Topic Handle Error, unlock task queue failed, queue: {:?}", queue);
-                }
-            } else {
-                error!("can't found handler for topic: {:?}", topic);
-            }
-        });
-        cast_js_task(TaskType::Sync(true), 0, Some(queue), func, Atom::from("topic ".to_string() + &topic_name + " handle task"));
-    }
-}
-
-impl RequestHandler {
-    /**
-    * 构建一个Rpc请求处理器
-    * @param gray 灰度对象
-    * @returns 返回Rpc请求处理器
-    */
-    pub fn new(gray: &Arc<RwLock<GrayTable>>) -> Self {
-        RequestHandler {
-            gray_tab: gray.clone()
-        }
-    }
-}
 
 // 设置http请求参数
 fn set_data(vm: Arc<JS>, msg: Arc<RefCell<XHashMap<String, SGenType>>>) {
@@ -1264,6 +492,352 @@ impl HttpHeaders {
     }
 }
 
+
+// 处理连接和关闭连接
+#[derive(Clone)]
+struct MqttConnectHandler {
+    gray_tab: Arc<RwLock<GrayTable>>,
+}
+
+impl MqttConnectHandler {
+    pub fn new(gray: &Arc<RwLock<GrayTable>>) -> Self {
+        MqttConnectHandler {
+            gray_tab: gray.clone()
+        }
+    }
+}
+
+impl Handler for MqttConnectHandler {
+    type A = MqttEvent;
+    type B = ();
+    type C = ();
+    type D = ();
+    type E = ();
+    type F = ();
+    type G = ();
+    type H = ();
+    type HandleResult = ();
+
+    fn handle(&self, env: Arc<dyn GrayVersion>, topic: Atom, args: Args<Self::A, Self::B, Self::C, Self::D, Self::E, Self::F, Self::G, Self::H>) -> Self::HandleResult {
+        let topic_handler = self.clone();
+        let id = env.get_id();
+        let queue = new_queue(id);
+        let func = Box::new(move |lock: Option<isize>| {
+            let gray_tab = topic_handler.gray_tab.read();
+            let gray = match gray_tab.jsgrays.last() {
+                Some(g) => {
+                    g.values().last()
+                }
+                None => panic!("gray is not exist"),
+            };
+
+            if let Some(gray) = gray {
+                let mgr = gray.mgr.clone();
+                let mgr_ptr = Box::into_raw(Box::new(mgr.clone())) as usize; // 数据库管理器
+                let connect = unsafe { Arc::from_raw(Arc::into_raw(env) as *const MqttConnectHandle) };
+                match args {
+                    Args::OneArgs(MqttEvent::Connect(socket_id, broker_name, client_id, keep_alive, is_clean_session, user, pwd, result)) => {
+                        //处理Mqtt连接
+                        let client_id_clone = client_id.clone();
+                        let real_args = Box::new(move |vm: Arc<JS>| -> usize {
+                            ptr_jstype(vm.get_objs(), vm.clone(), mgr_ptr, 2976191628);
+                            let mqtt_connection = MqttConnection::new(connect, Some(result), socket_id, client_id, Some(keep_alive), Some(is_clean_session), user, pwd);
+                            let mqtt_connection_ptr = Box::into_raw(Box::new(mqtt_connection)) as usize;
+                            ptr_jstype(vm.get_objs(), vm.clone(), mqtt_connection_ptr, 1629990554);
+                            let _ = vm.new_str(broker_name);
+                            3
+                        });
+
+                        gray.factory.call(Some(id), Atom::from("_$mqttConnect"), real_args, Atom::from(format!("mqtt connect, client_id = {:?}, socket_id = {:?}, keep_alive = {:?}", client_id_clone, socket_id, keep_alive)));
+                    }
+                    Args::OneArgs(MqttEvent::Disconnect(socket_id, broker_name, client_id, reason)) => {
+                        //处理Mqtt连接关闭
+                        let client_id_clone = client_id.clone();
+                        let real_args = Box::new(move |vm: Arc<JS>| -> usize {
+                            ptr_jstype(vm.get_objs(), vm.clone(), mgr_ptr, 2976191628);
+                            let mqtt_connection = MqttConnection::new(connect, None, socket_id, client_id, None, None, None, None);
+                            let mqtt_connection_ptr = Box::into_raw(Box::new(mqtt_connection)) as usize;
+                            ptr_jstype(vm.get_objs(), vm.clone(), mqtt_connection_ptr, 1629990554);
+    
+                            match reason {
+                                Ok(_) => {
+                                    let _ = vm.new_str("".to_string());
+                                }
+                                Err(e) => {
+                                    let _ = vm.new_str(e.to_string());
+                                }
+                            }
+                            let _ = vm.new_str(broker_name);
+                            4
+                        });
+
+                        gray.factory.call(Some(id), Atom::from("_$mqttDisconnect"), real_args, Atom::from(format!("mqtt disconnect, client_id = {:?}, socket_id = {:?}", client_id_clone, socket_id)));
+                    },
+                    _ => panic!("invalid MqttConnectHandler handler args"),
+                }
+
+                if !unlock_js_task_queue(queue) {
+                    warn!("!!!> MqttConnectHandler Error, unlock task queue failed, queue: {:?}", queue);
+                }
+            } else {
+                error!("can't found handler for topic: {:?}", topic);
+            }
+        });
+        cast_js_task(TaskType::Sync(true), 0, Some(queue), func, Atom::from("MqttConnectHandler"));
+    }
+}
+
+// 处理mqtt 订阅，退订和消息发布
+#[derive(Clone)]
+struct MqttRequestHandler {
+    gray_tab: Arc<RwLock<GrayTable>>,
+}
+
+impl MqttRequestHandler {
+    pub fn new(gray: &Arc<RwLock<GrayTable>>) -> Self {
+        MqttRequestHandler {
+            gray_tab: gray.clone()
+        }
+    }
+}
+
+impl Handler for MqttRequestHandler {
+    type A = MqttEvent;
+    type B = ();
+    type C = ();
+    type D = ();
+    type E = ();
+    type F = ();
+    type G = ();
+    type H = ();
+    type HandleResult = ();
+
+    fn handle(&self, env: Arc<dyn GrayVersion>, topic: Atom, args: Args<Self::A, Self::B, Self::C, Self::D, Self::E, Self::F, Self::G, Self::H>) -> Self::HandleResult {
+        let topic_handler = self.clone();
+        let id = env.get_id();
+        let queue = new_queue(id);
+
+        let func = Box::new(move |lock: Option<isize>| {
+            let gray_tab = topic_handler.gray_tab.read();
+            let gray = match gray_tab.jsgrays.last() {
+                Some(g) => {
+                    g.values().last()
+                }
+                None => panic!("gray is not exist"),
+            };
+
+            if let Some(gray) = gray {
+                let mgr = gray.mgr.clone();
+                let mgr_ptr = Box::into_raw(Box::new(mgr.clone())) as usize; // 数据库管理器
+                let connect = unsafe { Arc::from_raw(Arc::into_raw(env) as *const MqttConnectHandle) };
+
+                match args {
+                    Args::OneArgs(MqttEvent::Sub(socket_id, broker_name, client_id, topics, result)) => {
+                        //处理Mqtt订阅主题
+                        let real_args = Box::new(move |vm: Arc<JS>| -> usize {
+                            ptr_jstype(vm.get_objs(), vm.clone(), mgr_ptr, 2976191628);
+                            let mqtt_connection = MqttConnection::new(connect, Some(result), socket_id, client_id, None, None, None, None);
+                            let mqtt_connection_ptr = Box::into_raw(Box::new(mqtt_connection)) as usize;
+                            ptr_jstype(vm.get_objs(), vm.clone(), mqtt_connection_ptr, 1629990554);
+
+                            let arr = vm.new_array();
+                            for (index, topic) in topics.into_iter().enumerate() {
+                                let mut value = vm.new_str(topic.0).unwrap();
+                                vm.set_index(&arr, index as u32, &mut value);
+                            }
+                            let _ = vm.new_str(broker_name);
+                            4
+                        });
+                        gray.factory.call(Some(id), Atom::from("_$mqttSub"), real_args, Atom::from("MqttRequestHandler _$mqttSub"));
+                    },
+                    Args::OneArgs(MqttEvent::Unsub(socket_id, broker_name, client_id, topics)) => {
+                        //处理Mqtt退订主题
+                        let real_args = Box::new(move |vm: Arc<JS>| -> usize {
+                            ptr_jstype(vm.get_objs(), vm.clone(), mgr_ptr, 2976191628);
+                            let mqtt_connection = MqttConnection::new(connect, None, socket_id, client_id, None, None, None, None);
+                            let mqtt_connection_ptr = Box::into_raw(Box::new(mqtt_connection)) as usize;
+                            ptr_jstype(vm.get_objs(), vm.clone(), mqtt_connection_ptr, 1629990554);
+    
+                            let arr = vm.new_array();
+                            for (index, topic) in topics.into_iter().enumerate() {
+                                let mut value = vm.new_str(topic).unwrap();
+                                vm.set_index(&arr, index as u32, &mut value);
+                            }
+                            let _ = vm.new_str(broker_name);
+                            4
+                        });
+                        gray.factory.call(Some(id), Atom::from("_$mqttUnSub"), real_args, Atom::from("MqttRequestHandler _$mqttUnSub"));
+                    },
+                    Args::OneArgs(MqttEvent::Publish(socket_id, broker_name, client_id, address, topic, payload)) => {
+                        //处理Mqtt发布主题
+                        let real_args = Box::new(move |vm: Arc<JS>| -> usize {
+                            ptr_jstype(vm.get_objs(), vm.clone(), mgr_ptr, 2976191628);
+                            let mqtt_connection = MqttConnection::new(connect, None, socket_id, client_id, None, None, None, None);
+                            let mqtt_connection_ptr = Box::into_raw(Box::new(mqtt_connection)) as usize;
+                            ptr_jstype(vm.get_objs(), vm.clone(), mqtt_connection_ptr, 1629990554);
+    
+                            if let Some(addr) = address {
+                                let _ = vm.new_str(addr.to_string());
+                            } else {
+                                let _ = vm.new_str("".to_string());
+                            }
+                            let _ = vm.new_str(topic);
+                            let buffer = vm.new_uint8_array(payload.len() as u32);
+                            buffer.from_bytes(payload.as_ref());
+                            let _ = vm.new_str(broker_name);
+
+                            6
+                        });
+                        gray.factory.call(Some(id), Atom::from("_$mqttSend"), real_args, Atom::from("MqttRequestHandler _$mqttSend"));
+                    },
+                    _ => panic!("invalid MqttRequestHandler handler args"),
+                }
+
+                if !unlock_js_task_queue(queue) {
+                    warn!("!!!> MqttRequestHandler Error, unlock task queue failed, queue: {:?}", queue);
+                }
+            } else {
+                error!("can't found handler for topic: {:?}", topic);
+            }
+        });
+        cast_js_task(TaskType::Sync(true), 0, Some(queue), func, Atom::from("MqttRequestHandler"));
+    }
+}
+
+pub fn register_broker_topic(broker_name: String, topic: String) {
+    let mut brokers = BROKER_TOPICS.write();
+
+    if let Some(topics) = brokers.get_mut(&broker_name) {
+        topics.insert(topic);
+    } else {
+        let mut set = FnvHashSet::default();
+        set.insert(topic);
+        brokers.insert(broker_name, set);
+    }
+}
+
+pub fn broker_has_topic(broker_name: String, topic: String) -> bool {
+    if let Some(set) = BROKER_TOPICS.read().get(&broker_name) {
+        if let Some(_) = set.get(&topic) {
+            return true
+        }
+    }
+
+    // 是否在全局broker name
+    if let Some(set) = BROKER_TOPICS.read().get("*") {
+        if let Some(_) = set.get(&topic) {
+            return true
+        }
+    }
+
+    false
+}
+
+pub struct MqttConnection {
+    handle: Arc<MqttConnectHandle>,
+    connection_result: Option<AsyncResult>,
+    socket_id: usize,
+    client_id: String,
+    keep_alive: Option<u16>,
+    is_clean_session: Option<bool>,
+    user: Option<String>,
+    pwd: Option<String>,
+}
+
+impl MqttConnection {
+    pub fn new(handle: Arc<MqttConnectHandle>, connection_result: Option<AsyncResult>, socket_id: usize, client_id: String, keep_alive: Option<u16>, is_clean_session: Option<bool>, user: Option<String>, pwd: Option<String>) -> Self {
+        Self {
+            handle,
+            connection_result,
+            socket_id,
+            client_id,
+            keep_alive,
+            is_clean_session,
+            user,
+            pwd,
+        }
+    }
+
+    pub fn socket_id(&self) -> usize {
+        self.socket_id
+    }
+
+    pub fn client_id(&self) -> String {
+        self.client_id.clone()
+    }
+
+    pub fn keep_alive(&self) -> Option<u16> {
+        self.keep_alive
+    }
+
+    pub fn is_clean_session(&self) -> Option<bool> {
+        self.is_clean_session
+    }
+
+    pub fn user(&self) -> Option<String> {
+        self.user.clone()
+    }
+
+    pub fn pwd(&self) -> Option<String> {
+        self.pwd.clone()
+    }
+
+    pub fn get_token(&self) -> Option<usize> {
+        self.handle.get_token()
+    }
+
+    pub fn get_local_addr(&self) -> Option<String> {
+        self.handle.get_local_addr().map(|addr| addr.to_string())
+    }
+
+    pub fn get_remote_addr(&self) -> Option<String> {
+        self.handle.get_remote_addr().map(|addr| addr.to_string())
+    }
+
+    pub fn is_security(&self) -> bool {
+        self.handle.is_security()
+    }
+
+    pub fn set_connection_result(&self, result: bool) {
+        if result {
+            match &self.connection_result {
+                Some(res) => res.set(Ok(())),
+                None => {}
+            }
+        } else {
+            match &self.connection_result {
+                Some(res) => res.set(Err(Error::new(ErrorKind::Other, "connection refused by user"))),
+                None => {}
+            }
+        }
+    }
+
+    pub fn wakeup(&self) {
+        let _= self.handle.wakeup();
+    }
+
+    pub fn sub(&self, topic: String) {
+        self.handle.sub(topic)
+    }
+
+    pub fn unsub(&self, topic: String) {
+        self.handle.unsub(topic)
+    }
+
+    pub fn send(&self, topic: String, bin: &[u8]) {
+        self.handle.send(&topic, bin.to_vec());
+    }
+
+    pub fn reply(&self, bin: &[u8]) {
+        self.handle.reply(bin.to_vec());
+    }
+
+    pub fn close(&self, reason: String) {
+        debug!("close, reason = {:?}", reason);
+        let _ = self.handle.close(Ok(()));
+    }
+ }
+
 pub fn register_http_endpoint(key: String, val: String) {
     HTTP_ENDPOINT.write().insert(key, val);
 }
@@ -1280,102 +854,26 @@ pub fn get_all_http_rpc_mods() -> Vec<String> {
     HTTP_ENDPOINT.read().values().map(|s|s.to_string()).collect::<Vec<String>>()
 }
 
-/**
-* 创建Rpc服务
-*/
-pub fn create_rpc_service(handler: &RequestHandler) -> Arc<BaseService> {
-	let mut rpc_service = RpcService::new();
-    rpc_service.set_request_handler(Arc::new(handler.clone()));
-	let rpc_service = Arc::new(rpc_service);
-	Arc::new(BaseService::with_service(rpc_service))
-}
+pub fn bind_mqtt_tcp_port(port: u16, use_tls: bool, protocol: String, broker_name: String) {
+    let event_handler = Arc::new(MqttConnectHandler::new(&get_gray_table()));
+    let rpc_handler = Arc::new(MqttRequestHandler::new(&get_gray_table()));
+    let listener = Arc::new(MqttProxyListener::with_handler(Some(event_handler)));
+    let service = Arc::new(MqttProxyService::with_handler(Some(rpc_handler)));
 
-/**
-* 注册网络事件监听器
-*/
-pub fn register_rcp_listener(conect_handler: Option<&NetEventHandler>, close_handler: Option<&NetEventHandler>) -> Arc<RpcListener> {
-	let mut rpc_listener = RpcListener::new();
-	if let Some(r) = conect_handler {
-        rpc_listener.set_connected_handler(Arc::new(r.clone()));
-	}
-	if let Some(r) = close_handler {
-        rpc_listener.set_closed_handler(Arc::new(r.clone()));
-	}
-    let rpc_listener = Arc::new(rpc_listener);
-    let listener = Arc::new(BaseListener::with_listener(rpc_listener.clone()));
-	WS_MQTT3_BROKER.register_listener(listener);
-    rpc_listener
-}
-
-/**
-* 为指定的Mqtt主题，注册指定的Rpc服务
-*/
-pub fn register_rpc_topic(topic: String, service: &Arc<BaseService>) {
-    WS_MQTT3_BROKER.register_service(topic, service.clone());
-}
-
-/*
- * 取消注册指定的rpc服务
- */
-pub fn unregister_rpc_topic(topic: String) {
-    WS_MQTT3_BROKER.unregister_service(&topic);
-}
-
-/**
-* rpc回应
-*/
-pub fn rpc_reply(connect: &Arc<RpcConnect>, rid: u32, data: &[u8]) {
-    connect.reply(rid, Vec::from(data));
-}
-
-/**
-* rpc发送
-*/
-pub fn rpc_send(connect: &Arc<RpcConnect>, topic: String, rid: u32, data: &[u8]) {
-    connect.send(topic, rid, Vec::from(data));
-}
-
-/**
-* 为指定地址的指定端口，设置指定Websocket子协议名的全局Mqtt服务器，并绑定对应的Tcp端口
-*/
-pub fn global_mqtt_bind_tcp_ports(ip: String,                       //绑定的本地ip地址
-                                  ports: &[u16],
-                                  recv_buffer_size: usize,          //连接的接收缓冲区，单位B
-                                  send_buffer_size: usize,          //连接的发送缓冲区，单位B
-                                  read_buffer_capacity: usize,      //连接的读缓冲区，单位B
-                                  write_buffer_capacity: usize,     //连接的写缓冲区，单位次
-                                  pool_size: usize,                 //连接池的初始容量
-                                  stack_size: usize,                //连接线程的栈大小
-                                  timeout: usize,                   //连接轮询的间隔时长，单位毫秒
-                                  protocol: String) {
-    let mut factory = AsyncPortsFactory::<TcpSocket>::new();
-    for port in ports {
-        factory.bind(port.clone(),
-                     Box::new(WebsocketListenerFactory::<TcpSocket>::with_protocol_factory(
-                         Arc::new(WsMqtt311Factory::with_name(&protocol)))));
-    }
-
-    let mut config = SocketConfig::new(&ip, factory.bind_ports().as_slice());
-    config.set_option(recv_buffer_size, send_buffer_size, read_buffer_capacity, write_buffer_capacity);
-    let buffer = WriteBufferPool::new(10000, 10, 3).ok().unwrap();
-    match SocketListener::bind(factory, buffer, config, pool_size, stack_size, 1024, Some(timeout)) {
-        Err(e) => {
-            panic!("Mqtt bind tcp port Error, reason: {:?}", e);
-        },
-        Ok(_) => {
-            info!("===> Mqtt bind tcp port ok");
-        }
-    }
-}
-
-pub fn bind_mqtt_tcp_port(port: u16, use_tls: bool, protocol: String) {
     if use_tls {
+        let broker_factory = Arc::new(WssMqttBrokerFactory::new(&protocol, &broker_name, port));
+
         SECURE_SERVICES.write().push(SecureServices((port.clone(), Box::new(WebsocketListenerFactory::<FTlsSocket>::with_protocol_factory(
-            Arc::new(WssMqtt311Factory::with_name(&protocol)))))));
+            broker_factory)))));
     } else {
+        let broker_factory = Arc::new(WsMqttBrokerFactory::new(&protocol, &broker_name, port));
+
         INSECURE_SERVICES.write().push(InsecureServices((port.clone(), Box::new(WebsocketListenerFactory::<TcpSocket>::with_protocol_factory(
-            Arc::new(WsMqtt311Factory::with_name(&protocol)))))));
+            broker_factory)))));
+
     }
+    register_listener(&broker_name, listener);
+    register_service(&broker_name, service);
 }
 
 fn build_secure_service() -> Result<(), String> {
@@ -1814,20 +1312,18 @@ impl NetKernelOptions {
 /**
 * 可以在运行时线程安全的，为全局Mqtt服务器增加指定的主题
 */
-pub fn add_global_mqtt_topic(is_public: bool,   //是否为公共主题，指定用户的主题不是公共主题
+pub fn add_global_mqtt_topic(broker_name: String, is_public: bool,   //是否为公共主题，指定用户的主题不是公共主题
                              topic: String) {
     PLAT_MGR.register_mqtt_topic("_$global_mqtt".to_string(), topic.clone()); // 注册全局mqtt topic到平台管理器中
-    add_topic(is_public, topic, 0, None);
+    add_topic(&broker_name, is_public, topic, 0, None);
 }
 
 /**
 * 可以在运行时线程安全的，在全局Mqtt服务器上发布指定主题的消息
 */
-pub fn publish_global_mqtt_topic(is_public: bool,   //是否为公共主题，指定用户的主题不是公共主题
+pub fn publish_global_mqtt_topic(broker_name: String, is_public: bool,   //是否为公共主题，指定用户的主题不是公共主题
                                  topic: String, msg: &[u8]) {
-    if let Ok(bin) = encode(0, false, 0, msg) {
-        publish_topic(is_public, topic, 0, None, Arc::new(bin));
-    }
+    let r = publish_topic(broker_name, is_public, topic, 0, None, Arc::new(msg.to_vec()));
 }
 
 /**
@@ -2057,6 +1553,27 @@ pub fn parse_http_config(jstr: String) {
 */
 pub fn close_tcp_socket(uid: usize, reason: String) -> bool {
     close_socket(uid, Err(Error::new(ErrorKind::Other, reason)))
+}
+
+pub fn post_gi_data(data: String, url: String) {
+    if let Ok(mut client) = create_http_client("test".to_string(), HttpClientOptions::default()) {
+        let func = Box::new(move |_r| {
+            <HttpClient as SharedHttpc>::add_header(&mut client, Atom::from("content-type"), Atom::from("application/json"));
+            let body = HttpClientBody::<String>::body(data);
+            post(&client, Atom::from(url), body, Box::new(|r| {
+                match r {
+                    Ok((a, mut b)) => {
+                        debug!("gi response ============= {:?}", b.text());
+                    }
+                    Err(e) => {
+                        warn!("post gi errro ============ {:?}", e);
+                    }
+                }
+            }));
+        });
+    
+        cast_net_task(TaskType::Async(false), 100, None, func, Atom::from("post gi data"));
+    }
 }
 
 #[derive(Clone)]

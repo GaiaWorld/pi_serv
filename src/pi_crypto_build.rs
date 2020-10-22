@@ -349,13 +349,8 @@ fn call_901229592(js: Arc<JS>, v:Vec<JSType>) -> Option<CallResult>{
 	let param_error = "param error in verify";
 
 	let jst0 = &v[0];
-    let ptr = jstype_ptr(&jst0, js.clone(), 1545795468, false, param_error).expect("");
-	let jst0 = unsafe { &*(ptr as *const pi_crypto::signature::Rsa) };
-
-
-	let jst1 = &v[1];
-    if !jst1.is_number(){return Some(CallResult::Err(String::from(param_error)));}
-    let jst1 = match jst1.get_u32(){
+    if !jst0.is_number(){return Some(CallResult::Err(String::from(param_error)));}
+    let jst0 = match jst0.get_u32(){
         0 => pi_crypto::signature::PaddingAlg::RSA_PKCS1_SHA256,
         1 => pi_crypto::signature::PaddingAlg::RSA_PKCS1_SHA384,
         2 => pi_crypto::signature::PaddingAlg::RSA_PKCS1_SHA512,
@@ -364,6 +359,12 @@ fn call_901229592(js: Arc<JS>, v:Vec<JSType>) -> Option<CallResult>{
         5 => pi_crypto::signature::PaddingAlg::RSA_PSS_SHA512,
         _ => panic!("enum type error")
     };
+
+
+	let jst1 = &v[1];
+	if !jst1.is_uint8_array() && !jst1.is_array_buffer(){return Some(CallResult::Err(String::from(param_error))); }
+    let jst1 = jst1.to_bytes();
+
 
 
 	let jst2 = &v[2];
@@ -378,13 +379,34 @@ fn call_901229592(js: Arc<JS>, v:Vec<JSType>) -> Option<CallResult>{
 
 
 
-	let jst4 = &v[4];
-	if !jst4.is_uint8_array() && !jst4.is_array_buffer(){return Some(CallResult::Err(String::from(param_error))); }
-    let jst4 = jst4.to_bytes();
+    let result = pi_crypto::signature::Rsa::verify(jst0,jst1,jst2,jst3);let mut result = js.new_boolean(result);
+
+    Some(CallResult::Ok)
+}
+
+
+fn call_2878910515(js: Arc<JS>, v:Vec<JSType>) -> Option<CallResult>{
+	let param_error = "param error in alipay_verify";
+
+	let jst0 = &v[0];
+	if !jst0.is_uint8_array() && !jst0.is_array_buffer(){return Some(CallResult::Err(String::from(param_error))); }
+    let jst0 = jst0.to_bytes();
 
 
 
-    let result = pi_crypto::signature::Rsa::verify(jst0,jst1,jst2,jst3,jst4);let mut result = js.new_boolean(result);
+	let jst1 = &v[1];
+	if !jst1.is_uint8_array() && !jst1.is_array_buffer(){return Some(CallResult::Err(String::from(param_error))); }
+    let jst1 = jst1.to_bytes();
+
+
+
+	let jst2 = &v[2];
+	if !jst2.is_uint8_array() && !jst2.is_array_buffer(){return Some(CallResult::Err(String::from(param_error))); }
+    let jst2 = jst2.to_bytes();
+
+
+
+    let result = pi_crypto::signature::Rsa::alipay_verify(jst0,jst1,jst2);let mut result = js.new_boolean(result);
 
     Some(CallResult::Ok)
 }
@@ -2050,6 +2072,7 @@ pub fn register(mgr: &BonMgr){
     mgr.regist_fun_meta(FnMeta::CallArg(call_1239750690), 1239750690);
     mgr.regist_fun_meta(FnMeta::CallArg(call_2850709748), 2850709748);
     mgr.regist_fun_meta(FnMeta::CallArg(call_901229592), 901229592);
+    mgr.regist_fun_meta(FnMeta::CallArg(call_2878910515), 2878910515);
     mgr.regist_fun_meta(FnMeta::CallArg(call_2041863833), 2041863833);
     mgr.regist_fun_meta(FnMeta::CallArg(call_3809028580), 3809028580);
     mgr.regist_fun_meta(FnMeta::CallArg(call_3841573761), 3841573761);
