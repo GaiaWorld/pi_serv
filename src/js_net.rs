@@ -46,7 +46,6 @@ use vm_core::vm::{send_to_process, JSValue, Vm};
 use crate::create_init_vm;
 use crate::FILES_ASYNC_RUNTIME;
 use crate::MQTT_PORTS;
-
 use hash::XHashMap;
 use http::batch_load::BatchLoad;
 use http::cors_handler::CORSHandler;
@@ -65,6 +64,7 @@ use http::static_cache::StaticCache;
 use http::upload::UploadFile;
 use http::virtual_host::VirtualHostPool;
 use http::virtual_host::{VirtualHost, VirtualHostTab};
+use pi_serv_lib::js_gray::GRAY_MGR;
 use pi_serv_lib::js_net::{HttpConnect, HttpHeaders, MqttConnection};
 use pi_serv_lib::{set_pi_serv_handle, PiServNetHandle};
 
@@ -87,6 +87,8 @@ lazy_static! {
     static ref BUILD_LISTENER_TAB: Arc<RwLock<FnvHashMap<String, Pid>>> = Arc::new(RwLock::new(FnvHashMap::default()));
     // http端口绑定listenerPID
     static ref BUILD_HTTP_LISTENER_TAB: Arc<RwLock<FnvHashMap<String, (Pid, Vm)>>> = Arc::new(RwLock::new(FnvHashMap::default()));
+    // 记录所有的静态资源缓存
+    pub static ref HTTP_STATIC_CACHES: Arc<RwLock<Vec<Arc<StaticCache>>>> = Arc::new(RwLock::new(vec![]));
 }
 
 // 注册pi_ser方法
@@ -256,9 +258,12 @@ impl Handler for MqttRequestHandler {
         let connect = unsafe { Arc::from_raw(Arc::into_raw(env) as *const MqttConnectHandle) };
         let session = connect.get_session().unwrap();
         let context = session.as_ref().get_context();
-        // 获取会话中的pid  TODO当前的vm不存在，应该从灰度中获取vm实例，等接口完成后再修改
-        let (pid, vm) = context.get::<(Pid, Vm)>().unwrap().as_ref().clone();
+        // 获取会话中的pid
+        let pid = context.get::<Pid>().unwrap().as_ref().clone();
+        println!("!!!!!!!!!!!!!!!!!js_net pid:{:?}", pid);
+        let vm = GRAY_MGR.read().vm_instance(0, pid.0).unwrap();
         let vm_copy = vm.clone();
+        println!("!!!!!!!!!!!!!!!!!js_net vm_vid:{:?}", vm.get_vid());
         let context_v8 = ContextHandle(pid.1);
         match args {
             Args::OneArgs(MqttEvent::Sub(
@@ -365,54 +370,55 @@ pub fn broker_has_topic(broker_name: String, topic: String) -> bool {
 // TODO: 创建listenerPID
 pub fn create_listener_pid(port: u16, broker_name: &String) {
     // 判断pid是否存在
-    // BUILD_LISTENER_TAB.read().get(broker_name)
-    // if BUILD_LISTENER_TAB.read().get(broker_name).is_none() {
-    //     // 获取基础灰度对应的vm列表 TODO
-    //     // 更加port取余分配vm TODO
-    //     let mut vm = create_init_vm(11, 111, None);
-    //     let vm = vm.init().unwrap();
-    //     let vm_copy = vm.clone();
-    //     let cid = vm.alloc_context_id();
-    //     vm.spawn_task(async move {
-    //         let context = vm_copy.new_context(None, cid, None).await.unwrap();
-    //         if let Err(e) = vm_copy
-    //             .execute(
-    //                 context,
-    //                 "start_listener_pid.js",
-    //                 r#"
-    //         (<any>self)._$listener_set_receive();"#,
-    //             )
-    //             .await
-    //         {
-    //             panic!(e);
-    //         }
-    //     });
-    //     BUILD_LISTENER_TAB
-    //         .write()
-    //         .insert(broker_name.clone(), Pid(vm.get_vid(), cid));
-    // }
+    if BUILD_LISTENER_TAB.read().get(broker_name).is_none() {
+        // 获取基础灰度对应的vm列表
+        let vids = GRAY_MGR.read().gray_vids(0).unwrap();
+        // 更加port取余分配vm
+        let id = (port as usize) % vids.len();
+        let vm = GRAY_MGR.read().vm_instance(0, vids[id]).unwrap();
+        let vm_copy = vm.clone();
+        let cid = vm.alloc_context_id();
+        println!("!!!!!!!!!!!!!!create_listener_pid cid:{:?}", cid);
+        vm.spawn_task(async move {
+            let context = vm_copy.new_context(None, cid, None).await.unwrap();
+            if let Err(e) = vm_copy
+                .execute(
+                    context,
+                    "start_listener_pid.js",
+                    r#"_$listener_set_receive();"#,
+                )
+                .await
+            {
+                panic!(e);
+            }
+        });
+        BUILD_LISTENER_TAB
+            .write()
+            .insert(broker_name.clone(), Pid(vm.get_vid(), cid));
+    }
 }
 
-// TODO: 创建httpPID（每host一个）
-fn create_http_pid(host: String) {
+// 创建httpPID（每host一个）
+pub fn create_http_pid(host: String, port: u16) {
     // 判断pid是否存在
-    // if BUILD_HTTP_LISTENER_TAB.read().get(&host).is_none() {
-    //     // 获取基础灰度对应的vm列表 TODO
-    //     // 更加port取余分配vm TODO
-    //     let mut vm = create_init_vm(11, 111, None);
-    //     let vm = vm.init().unwrap();
-    //     let vm_copy = vm.clone();
-    //     let cid = vm.alloc_context_id();
-    //     vm.spawn_task(async move {
-    //         let context = vm_copy.new_context(None, cid, None).await.unwrap();
-    //         if let Err(e) = vm_copy.execute(context, "http_session_pid.js", r#""#).await {
-    //             panic!(e);
-    //         }
-    //     });
-    //     BUILD_HTTP_LISTENER_TAB
-    //         .write()
-    //         .insert(host.clone(), (Pid(vm.get_vid(), cid), vm));
-    // }
+    if BUILD_HTTP_LISTENER_TAB.read().get(&host).is_none() {
+        // 获取基础灰度对应的vm列表
+        let vids = GRAY_MGR.read().gray_vids(0).unwrap();
+        // 更加port取余分配vm
+        let id = (port as usize) % vids.len();
+        let vm = GRAY_MGR.read().vm_instance(0, vids[id]).unwrap();
+        let vm_copy = vm.clone();
+        let cid = vm.alloc_context_id();
+        vm.spawn_task(async move {
+            let context = vm_copy.new_context(None, cid, None).await.unwrap();
+            if let Err(e) = vm_copy.execute(context, "http_session_pid.js", r#""#).await {
+                panic!(e);
+            }
+        });
+        BUILD_HTTP_LISTENER_TAB
+            .write()
+            .insert(host.clone(), (Pid(vm.get_vid(), cid), vm));
+    }
 }
 
 // 绑定mqtt监听器
@@ -1114,6 +1120,8 @@ fn build_service<S: SocketTrait + StreamTrait>(
                 http_config.static_cache_max_size,
                 http_config.static_cache_max_len,
             ));
+            // 记录静态缓存对象，前端资源热更时删除所有缓存
+            HTTP_STATIC_CACHES.write().push(cache.clone());
             StaticCache::run_collect(
                 cache.clone(),
                 "http cache".to_string(),

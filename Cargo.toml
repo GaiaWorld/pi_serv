@@ -18,6 +18,7 @@ futures = "0.3"
 parking_lot = "0.11"
 clap = "2.33"
 num_cpus = "1.13"
+crossbeam-channel = "0.4"
 async = { path = "../pi_lib/async" }
 async_file = { path = "../pi_lib/async_file" }
 vm_core = { path = "../pi_v8/vm_core" }
@@ -36,6 +37,7 @@ magnetic = "2.0.0"
 toml = "0.4.6"
 json = "0.11.13" 
 rand = "0.5.2"
+dunce = "1.0.1"
 mqtt3 = { git = "https://github.com/tekjar/mqtt3" }
 hash_value = { path = "../pi_math/hash_value" }
 pi_db = { path = "../pi_db" }

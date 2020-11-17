@@ -34,6 +34,7 @@ use tcp::{
     server::{AsyncPortsFactory, SocketListener},
 };
 use vm_builtin::{ContextHandle, VmStartupSnapshot};
+use vm_builtin::{VmEvent, VmEventHandler, VmEventValue};
 use vm_core::{debug, init_v8, vm, worker};
 use ws::server::WebsocketListenerFactory;
 
@@ -41,10 +42,12 @@ use pi_serv_ext::register_ext_functions;
 use pi_serv_lib::set_pi_serv_lib_file_runtime;
 use pi_serv_lib::{js_db::global_db_mgr, js_gray::GRAY_MGR};
 
+mod hotfix;
 mod init;
 mod js_net;
 
 use crate::js_net::create_listener_pid;
+use hotfix::{hotfix_listen_backend, hotfix_listen_frontend};
 use init::init_js;
 use js_net::reg_pi_serv_handle;
 
@@ -68,6 +71,7 @@ lazy_static! {
     };
     //Mqtt端口代理映射表
     static ref MQTT_PORTS: Arc<Mutex<Vec<(u16, String)>>> = Arc::new(Mutex::new(vec![]));
+    static ref VID_CONTEXTS: Arc<Mutex<XHashMap<usize, Vec<ContextHandle>>>> = Arc::new(Mutex::new(XHashMap::default()));
 }
 
 /*
@@ -294,6 +298,44 @@ fn create_init_vm(
     builder.bind_condvar_waker(MAIN_CONDVAR.clone()).build()
 }
 
+// 注册虚拟机关心处理的事件
+fn reigster_vms_events(workers: &[vm::Vm]) {
+    // 设置虚拟机的事件回调
+    for worker in workers {
+        let event_handler = VmEventHandler::new(
+            AsyncRuntime::Local(MAIN_ASYNC_RUNTIME.clone()),
+            move |event, vid| match event {
+                VmEventValue::CreatedContext(context) => {
+                    debug!(
+                        "vm event handler: VmEventValue::CreatedContext, vid = {:?}",
+                        vid
+                    );
+                    VID_CONTEXTS
+                        .lock()
+                        .entry(vid)
+                        .and_modify(|v| {
+                            v.push(context);
+                        })
+                        .or_insert(vec![]);
+                }
+
+                VmEventValue::RemovedContext(context) => {
+                    debug!("vm event handler: VmEventValue::RemovedContext");
+                    VID_CONTEXTS
+                        .lock()
+                        .entry(vid)
+                        .and_modify(|v| {
+                            v.retain(|ctx| *ctx != context);
+                        })
+                        .or_insert(vec![]);
+                }
+            },
+        );
+        worker.register_event_handler(VmEvent::CreatedContext, event_handler.clone());
+        worker.register_event_handler(VmEvent::RemovedContext, event_handler);
+    }
+}
+
 /*
 * 异步执行入口，退出时不会中止主线程
 */
@@ -330,16 +372,12 @@ async fn async_main(
     );
 
     let vms: Vec<vm::Vm> = workers.iter().map(|(_, vm)| vm.clone()).collect();
-    init_default_gray(vms);
+    init_default_gray(vms.clone());
 
     //所有虚拟机启动完成之后创建listener pid
     init_listener_pid();
-
-    workers[0]
-        .1
-        .new_context(None, workers[0].1.alloc_context_id(), None)
-        .await
-        .unwrap();
+    reigster_vms_events(&vms);
+    enable_hotfix();
 }
 
 //初始化快照
@@ -413,9 +451,7 @@ fn init_work_vm(
             builder = builder.enable_inspect();
         }
         let worker_condvar = Arc::new((AtomicBool::new(false), Mutex::new(()), Condvar::new()));
-        let mut work_vm = builder
-            .bind_condvar_waker(worker_condvar.clone())
-            .build();
+        let mut work_vm = builder.bind_condvar_waker(worker_condvar.clone()).build();
         let work_vm_runner = work_vm.take_runner().unwrap();
 
         //启动工作线程，并运行工作虚拟机
@@ -456,5 +492,14 @@ fn init_default_gray(workers: Vec<vm::Vm>) {
 fn init_listener_pid() {
     for (port, broker_name) in MQTT_PORTS.lock().iter() {
         create_listener_pid(port.clone(), broker_name);
+    }
+}
+
+// 通过环境变量控制是否启动热更新
+fn enable_hotfix() {
+    if env::var("ENABLE_HOTFIX").is_ok() {
+        info!("start listen hotfix...");
+        hotfix_listen_backend(String::from("../dst_server"));
+        hotfix_listen_frontend();
     }
 }
