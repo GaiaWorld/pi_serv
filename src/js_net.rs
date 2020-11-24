@@ -1013,6 +1013,9 @@ fn build_service<S: SocketTrait + StreamTrait>(port: u16, http_configs: &Vec<Htt
                         if r.methods.contains(&"OPTIONS".to_string()) {
                             route.at(&r.endpoint).options(file_load_middleware.clone());
                         }
+                        if r.methods.contains(&"HEAD".to_string()) {
+                            route.at(&r.endpoint).head(file_load_middleware.clone());
+                        }
                     }
 
                     "filesLoad" => {
