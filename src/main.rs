@@ -84,6 +84,7 @@ use crate::js_net::create_listener_pid;
 use hotfix::{hotfix_listen_backend, hotfix_listen_frontend, HOTFIX_FILES};
 use init::{init_js, read_init_source};
 use js_net::{create_http_pid, reg_pi_serv_handle, start_network_services};
+use pi_db::db_collect::collect_db;
 
 #[cfg(feature = "default")]
 init_global_counter_alloc! {}
@@ -506,6 +507,9 @@ async fn async_main(
         #[cfg(feature = "profiling_heap")]
         set_default_ctrlc_handler();
     }
+
+    let start_at = get_db_collect_time();
+    collect_db(FILES_ASYNC_RUNTIME.clone(), start_at);
 }
 
 // 执行mfa
@@ -765,4 +769,12 @@ fn pid_close_count(vid: usize, context: ContextHandle) {
             let _ = vm_copy.gc(context).await;
         });
     }
+}
+
+// 获取数据库表整理时间 0~23
+fn get_db_collect_time() -> usize {
+    let file = std::fs::read_to_string("../dst_server/ptconfig.json").unwrap();
+    let json = parse(&file).unwrap();
+    let time = &json["colletc_time"];
+    time.as_usize().unwrap()
 }
