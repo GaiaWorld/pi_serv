@@ -66,7 +66,7 @@ use http::virtual_host::VirtualHostPool;
 use http::virtual_host::{VirtualHost, VirtualHostTab};
 use pi_core::create_snapshot_vm;
 use pi_serv_lib::js_gray::GRAY_MGR;
-use pi_serv_lib::js_net::{HttpConnect, HttpHeaders, MqttConnection};
+use pi_serv_lib::js_net::{HttpConnect, HttpHeaders, MqttCon};
 use pi_serv_lib::{set_pi_serv_handle, PiServNetHandle};
 
 lazy_static! {
@@ -198,7 +198,7 @@ impl Handler for MqttConnectHandler {
             )) => {
                 let pid = get_pid(&broker_name);
                 //处理Mqtt连接
-                let mqtt_connection = MqttConnection::new(
+                let mqtt_connection = MqttCon::new(
                     connect,
                     Some(result),
                     socket_id,
@@ -208,7 +208,7 @@ impl Handler for MqttConnectHandler {
                     user,
                     pwd,
                 );
-                let mqtt_connection_ptr = Box::into_raw(Box::new(mqtt_connection)) as usize;
+                let mqtt_connection_ptr = Arc::into_raw(Arc::new(mqtt_connection)) as usize;
                 let mut msgs = Vec::with_capacity(4);
                 msgs.push(ProcessMsg::String("connect".to_string()));
                 msgs.push(ProcessMsg::Number(socket_id as f64));
@@ -262,29 +262,29 @@ impl Handler for MqttRequestHandler {
         let connect = unsafe { Arc::from_raw(Arc::into_raw(env) as *const MqttConnectHandle) };
         let session = connect.get_session().unwrap();
         let context = session.as_ref().get_context();
+
+        let mut pid_option = None; // pid不存在则发送到listenerPID处理
+
         // 获取会话中的pid
-        let (pid, current) = context.get::<(Pid, bool)>().unwrap().as_ref().clone();
-        // 限流(达到软上限，就限制rpc并发)
-        if current {
-            // 获取虚拟机队列长度
-            let vm = GRAY_MGR.read().vm_instance(0, pid.0).unwrap();
-            let vm_queue_len = vm.queue_len();
-            if vm_queue_len > 0 && !connect.is_passive() {
-                connect.set_passive(true);
-            } else if connect.is_passive() {
-                connect.set_passive(false);
+        if let Some(data) = context.get::<(Pid, bool)>() {
+            let (pid, current) = data.as_ref().clone();
+            debug!("!!!!!!!!!!!!!!!!!js_net pid:{:?}", pid);
+            // 限流(达到软上限，就限制rpc并发)
+            if current {
+                // 获取虚拟机队列长度
+                let vm = GRAY_MGR.read().vm_instance(0, pid.0).unwrap();
+                let vm_queue_len = vm.queue_len();
+                if vm_queue_len > 0 && !connect.is_passive() {
+                    connect.set_passive(true);
+                } else if connect.is_passive() {
+                    connect.set_passive(false);
+                }
             }
+            pid_option = Some(pid);
         }
 
-        debug!("!!!!!!!!!!!!!!!!!js_net pid:{:?}", pid);
         match args {
-            Args::OneArgs(MqttEvent::Sub(
-                _socket_id,
-                _broker_name,
-                _client_id,
-                topics,
-                _result,
-            )) => {
+            Args::OneArgs(MqttEvent::Sub(socket_id, broker_name, _client_id, topics, _result)) => {
                 //处理Mqtt订阅主题
                 let mut msgs = Vec::new();
                 let mut topics_msg = Vec::new();
@@ -293,12 +293,19 @@ impl Handler for MqttRequestHandler {
                     topics_msg.push(ProcessMsg::String(sub_topic));
                 }
                 msgs.push(ProcessMsg::String("sub".to_string()));
+                msgs.push(ProcessMsg::Number(socket_id as f64));
                 msgs.push(ProcessMsg::Array(topics_msg));
+
+                let pid = if let Some(pid) = pid_option {
+                    pid
+                } else {
+                    get_pid(&broker_name)
+                };
 
                 // PID发送消息
                 send_to_process(None, pid, ProcessMsg::Array(msgs));
             }
-            Args::OneArgs(MqttEvent::Unsub(_socket_id, _broker_name, _client_id, topics)) => {
+            Args::OneArgs(MqttEvent::Unsub(socket_id, broker_name, _client_id, topics)) => {
                 //处理Mqtt退订主题
                 let mut msgs = Vec::new();
                 let mut topics_msg = Vec::new();
@@ -306,13 +313,21 @@ impl Handler for MqttRequestHandler {
                     topics_msg.push(ProcessMsg::String(sub_topic));
                 }
                 msgs.push(ProcessMsg::String("unsub".to_string()));
+                msgs.push(ProcessMsg::Number(socket_id as f64));
                 msgs.push(ProcessMsg::Array(topics_msg));
+
+                let pid = if let Some(pid) = pid_option {
+                    pid
+                } else {
+                    get_pid(&broker_name)
+                };
+
                 // PID发送消息
                 send_to_process(None, pid, ProcessMsg::Array(msgs));
             }
             Args::OneArgs(MqttEvent::Publish(
-                _socket_id,
-                _broker_name,
+                socket_id,
+                broker_name,
                 _client_id,
                 _address,
                 topic,
@@ -324,8 +339,16 @@ impl Handler for MqttRequestHandler {
 
                 let mut msgs = Vec::new();
                 msgs.push(ProcessMsg::String("publish".to_string()));
+                msgs.push(ProcessMsg::Number(socket_id as f64));
                 msgs.push(ProcessMsg::String(topic));
                 msgs.push(ProcessMsg::SharedArrayBuffer(buf));
+
+                let pid = if let Some(pid) = pid_option {
+                    pid
+                } else {
+                    get_pid(&broker_name)
+                };
+
                 // PID发送消息
                 send_to_process(None, pid, ProcessMsg::Array(msgs));
             }
@@ -446,20 +469,24 @@ pub fn bind_mqtt_tcp_port(port: u16, use_tls: bool, protocol: String, broker_nam
         let rpc_handler = Arc::new(MqttRequestHandler::new());
         let listener = Arc::new(MqttProxyListener::with_handler(Some(event_handler)));
         let service = Arc::new(MqttProxyService::with_handler(Some(rpc_handler)));
-    
+
         if use_tls {
             let broker_factory = Arc::new(WssMqttBrokerFactory::new(&protocol, &broker_name, port));
-    
+
             SECURE_SERVICES.write().push(SecureServices((
                 port.clone(),
-                Box::new(WebsocketListenerFactory::<FTlsSocket>::with_protocol_factory(broker_factory)),
+                Box::new(
+                    WebsocketListenerFactory::<FTlsSocket>::with_protocol_factory(broker_factory),
+                ),
             )));
         } else {
             let broker_factory = Arc::new(WsMqttBrokerFactory::new(&protocol, &broker_name, port));
-    
+
             INSECURE_SERVICES.write().push(InsecureServices((
                 port.clone(),
-                Box::new(WebsocketListenerFactory::<TcpSocket>::with_protocol_factory(broker_factory)),
+                Box::new(
+                    WebsocketListenerFactory::<TcpSocket>::with_protocol_factory(broker_factory),
+                ),
             )));
         }
         register_listener(&broker_name, listener);
@@ -514,8 +541,7 @@ impl Handler for InsecureHttpRpcRequstHandler {
                 } else {
                     host_c.to_string()
                 };
-                let (pid, _vm) =
-                    get_http_pid(&host);
+                let (pid, _vm) = get_http_pid(&host);
                 //  http连接
                 let mut http_connect = HttpConnect::new(addr);
                 http_connect.set_insecure_resp_handle(handler);
