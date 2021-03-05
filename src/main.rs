@@ -508,8 +508,11 @@ async fn async_main(
         set_default_ctrlc_handler();
     }
 
-    let start_at = get_db_collect_time();
-    collect_db(FILES_ASYNC_RUNTIME.clone(), start_at);
+    if let Some(start_at) = get_db_collect_time() {
+        collect_db(FILES_ASYNC_RUNTIME.clone(), start_at);
+    } else {
+        warn!("no database collect time specified");
+    }
 }
 
 // 执行mfa
@@ -782,9 +785,9 @@ fn pid_close_count(vid: usize, _context: ContextHandle) {
 }
 
 // 获取数据库表整理时间 0~23
-fn get_db_collect_time() -> usize {
+fn get_db_collect_time() -> Option<u32> {
     let file = std::fs::read_to_string("../dst_server/ptconfig.json").unwrap();
     let json = parse(&file).unwrap();
     let time = &json["collect_time"];
-    time.as_usize().unwrap()
+    time.as_u32()
 }
