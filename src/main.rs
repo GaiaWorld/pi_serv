@@ -460,7 +460,8 @@ async fn async_main(
                 (work_vm_runner.queue_len() == 0, run_time)
             }
         },
-    );
+    )
+    .await;
 
     let vms: Vec<vm::Vm> = workers.iter().map(|(_, vm)| vm.clone()).collect();
     reigster_vms_events(&vms, debug_port.is_some());
