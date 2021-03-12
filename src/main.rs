@@ -171,6 +171,12 @@ fn main() {
                 .takes_value(true),
         )
         .arg(
+            Arg::with_name("DEBUG_BREAK") //工作虚拟机允许调试暂停
+                .short("B")
+                .long("DEBUG_BREAK")
+                .help("Enable debug break work vm on port"),
+        )
+        .arg(
             Arg::with_name("CONSOLE") //工作虚拟机控制台模式
                 .short("C")
                 .long("CONSOLE")
@@ -277,6 +283,12 @@ fn main() {
         }
     }
 
+    let mut debug_break = false;
+    if let Some(_) = matches.index_of("DEBUG_BREAK") {
+        //允许虚拟机调试暂停
+        debug_break = true;
+    }
+
     let mut is_profiling = false;
     if let Some(_) = matches.index_of("PROFILING") {
         //允许剖析虚拟机
@@ -369,6 +381,7 @@ fn main() {
             init_heap_size,
             max_heap_size,
             debug_port,
+            debug_break,
         )
         .await;
     }) {
@@ -403,6 +416,7 @@ async fn async_main(
     init_heap_size: usize,
     max_heap_size: usize,
     debug_port: Option<u16>,
+    debug_break: bool,
 ) {
     // 加载native funtion
     register_ext_functions();
@@ -449,6 +463,7 @@ async fn async_main(
         init_heap_size,
         max_heap_size,
         debug_port,
+        debug_break,
         work_vm_count,
         "PI-SERV",
         2,
