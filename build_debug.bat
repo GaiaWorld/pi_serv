@@ -6,7 +6,7 @@ if not defined PI_JS_PROXY_TS_PATH (
     set PI_JS_PROXY_TS_PATH=..\pi_pt
 )
 
-cargo clean -p pi_serv
+cargo clean --target-dir target\debug\pi_serv.exe
 cargo b
 
 pause;
